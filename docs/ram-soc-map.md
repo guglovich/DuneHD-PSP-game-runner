@@ -1,4 +1,4 @@
-# RAM и SoC: карта памяти Sigma SMP8645
+# RAM и SoC: карта памяти Sigma SMP8642
 
 Собрано по данным, полученным на живом плеере. Проверялось только чтением:
 `/proc/devices`, `/proc/meminfo`, `/proc/interrupts`, узлы в `/dev`.

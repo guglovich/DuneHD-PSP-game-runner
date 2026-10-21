@@ -1133,7 +1133,7 @@ int main(int argc, char **argv)
 
     printf("========================================\n");
     printf("  PSP HLE Runtime для Dune HD Max\n");
-    printf("  Sigma SMP8645, MIPS32 LE\n");
+    printf("  Sigma SMP8642, MIPS32 LE\n");
     printf("========================================\n\n");
 
     /* Образ ISO 9660 с игрой: сначала достать EBOOT.BIN.

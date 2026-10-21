@@ -1,7 +1,7 @@
 # Dune HD PSP Game Runner
 
 Run PlayStation Portable games **natively** on a Dune HD Max media player
-(Sigma SMP8645, MIPS32 little-endian) — a **MIPS-on-MIPS** approach: no CPU
+(Sigma SMP8642, MIPS32 little-endian) — a **MIPS-on-MIPS** approach: no CPU
 emulator, no JIT. The guest game binary executes as ordinary native code
 inside the player's UI process, and the PSP operating system is replaced by a
 hand-written HLE (high-level emulation) layer.

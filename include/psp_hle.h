@@ -1,6 +1,6 @@
 /*
  * PSP HLE Runtime — заголовочный файл
- * Портирование PSP игр на Dune HD Max (Sigma SMP8645, MIPS32 LE)
+ * Портирование PSP игр на Dune HD Max (Sigma SMP8642, MIPS32 LE)
  *
  * Архитектура:
  *   1. ELF Loader — загрузка расшифрованного EBOOT.BIN (MIPS ELF)

@@ -1,6 +1,6 @@
 # PSP HLE Runtime для Dune HD Max
 
-Портирование PSP игр на медиаплеер Dune HD Max (Sigma SMP8645, MIPS32 LE).
+Портирование PSP игр на медиаплеер Dune HD Max (Sigma SMP8642, MIPS32 LE).
 
 ## Архитектура
 
