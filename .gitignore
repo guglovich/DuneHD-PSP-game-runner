@@ -1,0 +1,40 @@
+# --- game content: never commit (copyright) ---
+*.iso
+*.cso
+*.elf
+*.prx
+EBOOT.BIN
+*.ppm
+
+# --- build artifacts ---
+*.so
+*.so.new
+*.o
+*.a
+
+# host-compiled probes (tracked by name, they have no extension)
+/cso_extract
+/find-k0-selftest
+/ge_walk_test
+/gfx_command_test
+/guest_enter_test
+/guest_load_test
+/guest_trap_trace
+/iso_extract_eboot
+/mem_probe
+/pspdecrypt
+/psp-hle
+/ptrace_probe
+/tramp_dump
+/trap_probe
+/uctx_layout
+/uctx_segv
+/tools/gpcheck
+
+# --- local runtime state ---
+/tmp/
+
+# --- misc ---
+__pycache__/
+*.pyc
+.DS_Store
