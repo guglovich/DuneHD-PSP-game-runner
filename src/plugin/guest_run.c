@@ -2884,6 +2884,22 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	if (nid == 0x278C0DF5u)     /* sceKernelWaitThreadEnd — поток уже завершён */
 		return 0;
 
+	if (nid == 0xD59EAD2Fu) {   /* sceKernelWakeupThread */
+		/* Замер 95: task-воркер (entry 0x088C295C) поллит
+		 * g_qhead в цикле SleepThread; будить по-настоящему не
+		 * нужно (поллинг), но ВЫЗОВ обязан быть видимым: если
+		 * игра будит воркер, а мы молчим — это потерянное
+		 * событие. Логируем первые 16: tid звонившего и uid. */
+		static u32 wk_n;
+
+		if (g_log_fd >= 0 && wk_n < 16) {
+			wk_n++;
+			early_log("WKX", (u32)plat_gettid());
+			early_log("WKU", (args != NULL) ? args[0] : 0);
+		}
+		return 0;
+	}
+
 	if (!is_implemented(nid))
 		g_run.unknown++;
 	return 0;
@@ -3877,6 +3893,25 @@ static void guest_fault_handler(int sig, void *info, void *uc)
 			early_log("WSC",
 			    *(const u32 *)((const unsigned char *)g_mod->memory
 			                   + (0x08B2D7D8u - g_mod->base)));
+			/* Замер 95: адрес флага выведен из релокационной
+			 * пары и может быть смещён — дампим окрестности
+			 * обоих слов целиком. */
+			for (wa = 0; wa < 24u; wa++) {
+				u32 ad = 0x08BAA780u + 4u * wa;
+				if (ad + 4u > g_mod->base + g_mod->map_size)
+					break;
+				early_log("WN1",
+				    *(const u32 *)((const unsigned char *)
+				                   g_mod->memory
+				                   + (ad - g_mod->base)));
+			}
+			for (wa = 0; wa < 8u; wa++) {
+				u32 ad = 0x08B2D7C0u + 4u * wa;
+				early_log("WN2",
+				    *(const u32 *)((const unsigned char *)
+				                   g_mod->memory
+				                   + (ad - g_mod->base)));
+			}
 		}
 	}
 
