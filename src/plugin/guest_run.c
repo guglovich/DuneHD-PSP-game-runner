@@ -3722,6 +3722,62 @@ static void guest_fault_handler(int sig, void *info, void *uc)
 			rn = fault_raw_dump(uc, info, g_mod, rb);
 			(void)plat_write(g_log_fd, rb, (size_t)rn);
 		}
+
+		/* ДИАГНОСТИКА ЗАМЕРА 91 (ef6da1e7): первый сбой в зоне
+		 * walk'а 0x08AB0xxx..0x08AB2xxx — дампить ТАБЛИЦУ (это
+		 * `$a1` прогона: 0x08BAEFDC, поля +4 массив, +8 count),
+		 * сам МАССИВ ([a1+4], элементы по 16 Б: +0 ключ, +4 база
+		 * подобъекта, +12 индекс) и ПОЛЯ МЕНЕДЖЕРА аллокатора
+		 * 0x08BB7D80+0xC0..0x180 — там лежат бэкенды (+0xD4,
+		 * +0xF0, +0x154, +0x168), которые возвращают 0 и из-за
+		 * которых гость льёт memset(uncached(NULL)). Яд
+		 * 0xC6600BC0 в `$v1` пережил три сборки — статически
+		 * производитель не найден, смотрим память по факту. */
+		if (g_fault_total == 1 && pc_v >= 0x08AB0000u
+		    && pc_v < 0x08AB3000u && g_mod != 0
+		    && g_mod->memory != 0) {
+			u32 a1 = *(const u32 *)((const unsigned char *)uc
+			                        + 40 + 8 * 5);   /* $a1 */
+			u32 arrp = 0;
+			u32 wa;
+
+			early_log("WA1", a1);
+			for (wa = 0; wa < 16u; wa++) {
+				u32 ad = a1 + 4u * wa;
+				if (ad < g_mod->base
+				    || ad + 4u > g_mod->base + g_mod->map_size)
+					break;
+				early_log("WAT",
+				    *(const u32 *)((const unsigned char *)
+				                   g_mod->memory
+				                   + (ad - g_mod->base)));
+			}
+			if (a1 >= g_mod->base && a1 + 8u < g_mod->base + g_mod->map_size) {
+				arrp = *(const u32 *)((const unsigned char *)
+				         g_mod->memory + (a1 + 4u - g_mod->base));
+				early_log("WA2", arrp);
+				for (wa = 0; wa < 40u; wa++) {
+					u32 ad = arrp + 4u * wa;
+					if (ad < g_mod->base || ad + 4u
+					    > g_mod->base + g_mod->map_size)
+						break;
+					early_log("WAR",
+					    *(const u32 *)((const unsigned char *)
+					                   g_mod->memory
+					                   + (ad - g_mod->base)));
+				}
+			}
+			for (wa = 0; wa < 40u; wa++) {
+				u32 ad = 0x08BB7D80u + 0xC0u + 4u * wa;
+				if (ad < g_mod->base
+				    || ad + 4u > g_mod->base + g_mod->map_size)
+					break;
+				early_log("WBM",
+				    *(const u32 *)((const unsigned char *)
+				                   g_mod->memory
+				                   + (ad - g_mod->base)));
+			}
+		}
 	}
 
 	/* Подробный дамп регистров печатается только для первых сбоев: при
