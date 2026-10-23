@@ -595,6 +595,8 @@ static void report_imports(int fd)
 		put_hex(fd, guest_run_cb_created());
 		PUT(fd, " cb_fired=");
 		put_hex(fd, guest_run_cb_fired());
+		PUT(fd, " si_fired=");
+		put_hex(fd, guest_run_si_fired());
 		PUT(fd, "\n");
 
 		/* Внутренние глобали гостя (vaddr образа, расшифрованы

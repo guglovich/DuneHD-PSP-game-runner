@@ -1130,6 +1130,48 @@ static void cbk_deliver(void)
 	}
 }
 
+/* --- СУБ-ПРЕРЫВАНИЯ (sceKernelRegisterSubIntrHandler) -------------------
+ *
+ * Замер 92 (2ac0de9e), дамп walk'а: бэкенд аллокатора 0x08ABA704
+ * возвращает 0, пока у глобального флага [0x08BAA7AC] не стоит бит 0.
+ * Единственный писатель флага в госте — сеттер 0x08AB97F0, и ЕДИНСТВЕННЫЙ
+ * его вызов (0x088C2530) передаёт 0, то есть ОБНУЛЯЕТ. Значит единицу
+ * ставит не линейный код гостя, а обработчик суб-прерывания: игра
+ * регистрирует RegisterSubIntrHandler(30=VBLANK, …) (замер по счётчику
+ * a0=0x1E) — на PSP ядро зовёт его 60 раз в секунду, и этот тик качает
+ * звуковой движок («SXGS»), поднимая флаг и заполняя таблицы. Наша
+ * заглушка не вызывала обработчик НИ РАЗУ — насос стоял, аллокатор
+ * навсегда видел «звук не готов» и возвращал NULL.
+ *
+ * Доставка — тот же приём, что у колбеков: ПРЯМОЙ вызов гостевой
+ * функции (гость не использует `$gp` для глобалов — проверено
+ * дизасмом, README §5). Качает его парк в `sceKernelSleepThreadCB`
+ * (ptnCallbackTh), с периодом ~16 мс = VBlank. */
+#define SI_SLOTS		4u
+
+static struct {
+	u32 intr;     /* линия прерывания (30 = VBLANK) */
+	u32 handler;  /* гостевая функция */
+	u32 common;   /* её аргумент */
+	u32 enabled;  /* EnableSubIntr прошёл */
+} g_si[SI_SLOTS];
+static u32 g_si_fired;
+
+static void si_fire(void)
+{
+	u32 i;
+
+	for (i = 0; i < SI_SLOTS; i++) {
+		void (*fn)(u32);
+
+		if (g_si[i].handler == 0 || g_si[i].enabled == 0)
+			continue;
+		fn = (void (*)(u32))(uintptr_t)g_si[i].handler;
+		g_si_fired++;
+		fn(g_si[i].common);
+	}
+}
+
 /* Нулевой блок арены разделов под фейковый объект ядра.
  * Возвращает ГОСТЕВОЙ адрес блока, 0 — арена исчерпана. */
 static u32 font_obj_block(void)
@@ -2407,8 +2449,16 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 
 			if (ab_deliver)
 				cbk_deliver();
+			/* Насос суб-прерываний: тик VBLANK ~60 Гц. Это
+			 * НЕ то же, что выключенная доставка колбеков:
+			 * колбеки — ответы на события, которых не было,
+			 * а VBlank-тик на PSP идёт ВСЕГДА, с самого
+			 * старта, и init-мастер на него рассчитывает
+			 * (звуковой движок поднимает флаг готовности
+			 * именно из тика — замер 92). */
+			si_fire();
 			cbk_sample();
-			plat_sleep_ms(50);
+			plat_sleep_ms(15);
 		}
 		return 0;
 	}
@@ -2791,6 +2841,39 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 
 	if (nid == 0xF983B186u)     /* __sceSasRevVON — возврат 0 = успех */
 		return 0;
+
+	if (nid == 0xCA04A2B9u) {   /* sceKernelRegisterSubIntrHandler */
+		/* (intr, slot, handler, common) — см. блок `g_si`: без
+		 * вызова обработчика звуковой движок не поднимает флаг
+		 * готовности, и аллокатор возвращает NULL. */
+		u32 i;
+
+		for (i = 0; i < SI_SLOTS; i++) {
+			if (g_si[i].handler == 0
+			    || (g_si[i].intr == ((args != NULL) ? args[0] : 0)
+			        && g_si[i].handler
+			               == ((args != NULL) ? args[2] : 0))) {
+				g_si[i].intr = (args != NULL) ? args[0] : 0;
+				g_si[i].handler = (args != NULL) ? args[2] : 0;
+				g_si[i].common = (args != NULL) ? args[3] : 0;
+				break;
+			}
+		}
+		return 0;
+	}
+
+	if (nid == 0xFB8E22ECu) {   /* sceKernelEnableSubIntr */
+		u32 i;
+
+		for (i = 0; i < SI_SLOTS; i++) {
+			if (g_si[i].handler != 0
+			    && g_si[i].intr == ((args != NULL) ? args[0] : 0)) {
+				g_si[i].enabled = 1;
+				break;
+			}
+		}
+		return 0;
+	}
 
 	if (nid == 0x278C0DF5u)     /* sceKernelWaitThreadEnd — поток уже завершён */
 		return 0;
@@ -5464,6 +5547,7 @@ u32 guest_run_ef_created(void) { return g_ef.created; }
 u32 guest_run_cb_created(void) { return g_cb.created; }
 
 u32 guest_run_cb_fired(void)   { return g_cb.fired; }
+u32 guest_run_si_fired(void)  { return g_si_fired; }
 
 /* Сколько `ins`/`ext` эмулировано при SIGILL. 0 — SIGILL не было
  * или в окне не нашлось SPECIAL3. */

@@ -150,6 +150,7 @@ u32  guest_run_ef_created(void);
  * (прогон 39: игра создаёт callback, получает uid > 0). */
 u32  guest_run_cb_created(void);
 u32  guest_run_cb_fired(void);
+u32  guest_run_si_fired(void);   /* тики суб-прерываний (замер 92) */
 
 /* Показ последнего кадра гостя на экран плеера (конвейер RUA/GFX).
  * Вызывается из точки входа плагина ПОСЛЕ записи отчёта.
