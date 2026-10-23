@@ -3887,9 +3887,14 @@ static void guest_fault_handler(int sig, void *info, void *uc)
 			 * сбоя — построитель 0x088C2xxx регистрирует
 			 * методы и обнуляет флаг; кто поднимает обратно —
 			 * вопрос, на который отвечают эти два слова. */
+			/* Замер 96: адрес флага исправлен — прежний был на
+			 * 0x40000 выше (повтор исходной ошибки SGSB).
+			 * Верный: vaddr 0x3667AC = runtime 0x08B6A7AC,
+			 * file-init 7. Зачистка (F_build) по boot-порядку
+			 * идёт ПОСЛЕ walk'а — на момент сбоя ждём 7. */
 			early_log("WSF",
 			    *(const u32 *)((const unsigned char *)g_mod->memory
-			                   + (0x08BAA7ACu - g_mod->base)));
+			                   + (0x08B6A7ACu - g_mod->base)));
 			early_log("WSC",
 			    *(const u32 *)((const unsigned char *)g_mod->memory
 			                   + (0x08B2D7D8u - g_mod->base)));
@@ -3897,7 +3902,7 @@ static void guest_fault_handler(int sig, void *info, void *uc)
 			 * пары и может быть смещён — дампим окрестности
 			 * обоих слов целиком. */
 			for (wa = 0; wa < 24u; wa++) {
-				u32 ad = 0x08BAA780u + 4u * wa;
+				u32 ad = 0x08B6A780u + 4u * wa;
 				if (ad + 4u > g_mod->base + g_mod->map_size)
 					break;
 				early_log("WN1",
@@ -3912,6 +3917,25 @@ static void guest_fault_handler(int sig, void *info, void *uc)
 				                   g_mod->memory
 				                   + (ad - g_mod->base)));
 			}
+			/* Игровой массив объектов ($a2 замера 90):
+			 * 10 элементов по 16 Б — базы подобъектов с
+			 * ядом живут здесь. */
+			for (wa = 0; wa < 40u; wa++) {
+				u32 ad = 0x08BB0000u + 4u * wa;
+				if (ad + 4u > g_mod->base + g_mod->map_size)
+					break;
+				early_log("WN3",
+				    *(const u32 *)((const unsigned char *)
+				                   g_mod->memory
+				                   + (ad - g_mod->base)));
+			}
+			/* Очередь задач на момент сбоя. */
+			early_log("WQH",
+			    *(const u32 *)((const unsigned char *)g_mod->memory
+			                   + (0x0882CEE4u - g_mod->base)));
+			early_log("WQT",
+			    *(const u32 *)((const unsigned char *)g_mod->memory
+			                   + (0x0882CEE8u - g_mod->base)));
 		}
 	}
 
