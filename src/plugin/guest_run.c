@@ -3866,6 +3866,17 @@ static void guest_fault_handler(int sig, void *info, void *uc)
 				                   g_mod->memory
 				                   + (ad - g_mod->base)));
 			}
+			/* Замер 94: флаг готовности (file-init 7, бэкенду
+			 * нужен бит 0) и условие VBlank-handshake на МОМЕНТ
+			 * сбоя — построитель 0x088C2xxx регистрирует
+			 * методы и обнуляет флаг; кто поднимает обратно —
+			 * вопрос, на который отвечают эти два слова. */
+			early_log("WSF",
+			    *(const u32 *)((const unsigned char *)g_mod->memory
+			                   + (0x08BAA7ACu - g_mod->base)));
+			early_log("WSC",
+			    *(const u32 *)((const unsigned char *)g_mod->memory
+			                   + (0x08B2D7D8u - g_mod->base)));
 		}
 	}
 

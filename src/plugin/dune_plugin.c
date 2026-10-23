@@ -606,6 +606,12 @@ static void report_imports(int fd)
 		put_hex(fd, guest_run_state(0x327FF4u));
 		PUT(fd, " g_initdone=0x");
 		put_hex(fd, guest_run_state(0x327FF5u));
+		/* Замер 94: флаг готовности звука (file-init 7; бэкенду
+		 * аллокатора нужен бит 0) и условие VBlank-хендшейка. */
+		PUT(fd, " g_sndflag=0x");
+		put_hex(fd, guest_run_state(0x3667ACu));
+		PUT(fd, " g_sndcond=0x");
+		put_hex(fd, guest_run_state(0x3297D8u));
 		PUT(fd, " g_qhead=0x");
 		put_hex(fd, guest_run_state(0x325C08u));
 		PUT(fd, " g_qtail=0x");
