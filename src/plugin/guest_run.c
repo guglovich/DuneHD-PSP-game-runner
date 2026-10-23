@@ -1151,8 +1151,9 @@ static void cbk_deliver(void)
 
 static struct {
 	u32 intr;     /* линия прерывания (30 = VBLANK) */
+	u32 slot;     /* слот: ядро PSP передаёт его первым аргументом */
 	u32 handler;  /* гостевая функция */
-	u32 common;   /* её аргумент */
+	u32 common;   /* второй аргумент обработчика */
 	u32 enabled;  /* EnableSubIntr прошёл */
 } g_si[SI_SLOTS];
 static u32 g_si_fired;
@@ -1162,13 +1163,17 @@ static void si_fire(void)
 	u32 i;
 
 	for (i = 0; i < SI_SLOTS; i++) {
-		void (*fn)(u32);
+		void (*fn2)(u32, u32);
 
 		if (g_si[i].handler == 0 || g_si[i].enabled == 0)
 			continue;
-		fn = (void (*)(u32))(uintptr_t)g_si[i].handler;
+		fn2 = (void (*)(u32, u32))(uintptr_t)g_si[i].handler;
 		g_si_fired++;
-		fn(g_si[i].common);
+		/* Замер 93 (38a1ac13): 600 032 тика не сделали ничего —
+		 * обработчик 0x08A385F4 первым делом требует a0 == слоту
+		 * (10), а мы передавали common. Ядро PSP зовёт суб-инт
+		 * обработчики как handler(slot, common). */
+		fn2(g_si[i].slot, g_si[i].common);
 	}
 }
 
@@ -2854,6 +2859,7 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 			        && g_si[i].handler
 			               == ((args != NULL) ? args[2] : 0))) {
 				g_si[i].intr = (args != NULL) ? args[0] : 0;
+				g_si[i].slot = (args != NULL) ? args[1] : 0;
 				g_si[i].handler = (args != NULL) ? args[2] : 0;
 				g_si[i].common = (args != NULL) ? args[3] : 0;
 				break;
