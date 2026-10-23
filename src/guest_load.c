@@ -393,28 +393,85 @@ static bool map_guest(GuestModule *m)
      * собственных фиксированных адресов PSP. */
     map_vpl(m);
 
-    /* НУЛЕВАЯ СТРАНИЦА — читаемые нули.
+    /* НУЛЕВАЯ СТРАНИЦА + СКРЕТЧПАД — регион [0x0, 0x14000), ОБА вида.
      *
-     * Прогоны 39–45: цепочка NULL-указателей в потоке колбэков
-     * (tid=0x5ED) давится на `strlen(NULL+8)` — чтение байтов
-     * 8,9,…,0x11 из неотображённой нулевой страницы. Если нулевая
-     * страница читаема и заполнена нулями, strlen находит
-     * терминатор на первом байте и возвращает 0, а таблицы с
-     * базой NULL читают нули вместо сбоя.
+     * Прогоны 39–45: цепочка NULL-указателей в потоке колбэков давится
+     * на `strlen(NULL+8)` — отсюда читаемые нули в 0x0..0xFFFF.
      *
-     * Это ДИАГНОСТИЧЕСКИЙ шаг: на настоящей PSP нулевая страница
-     * НЕ отображается. Если маппинг не проходит (mmap_min_addr),
-     * загрузка продолжается без него. */
+     * Замер 90 (652ee635) добавил вторую половину: uncached-вид
+     * 0x4000xxxx НЕ был отображён, и побайтовая заливка региона
+     * 0x40000000.. шла 65 537 фолтами — каждый байт обрабатывался
+     * эмуляцией, а на границе скретчпада (0x40010000, вне «нулевой
+     * страницы» обработчика) поток был убит SPINDEAD. На PSP это
+     * настоящая память: скретчпад — 16 КиБ быстрой SRAM по 0x10000,
+     * читаемая и записываемая через оба зеркала.
+     *
+     * Оба вида — из ОДНОГО tmpfs-файла: запись через кэшируемый вид
+     * видна через uncached и наоборот, как на PSP. Право исполнения
+     * не даётся — данных в этом регионе кода не бывает.
+     *
+     * Отказ любого вида не рушит загрузку: uncached-фолты в зоне
+     * обрабатывает эмуляция нулевой страницы (как до этой правки). */
+    m->null_mirror = 0;
+    m->scr_base = 0;
     {
-        void *z = mmap(NULL, 0x10000,
-                       PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-                       -1, 0);
+        enum { NULLREG_BYTES = 0x14000u };   /* 0x0..0x13FFF */
+        int nfd = open("/tmp/.psp_guest_null", O_RDWR | O_CREAT | O_TRUNC,
+                       0600);
 
-        if (z == MAP_FAILED)
-            z = NULL;
-        /* Не проверяем адрес: если ядро отдало другой, это
-         * безвредно — главное, что нулевая страница не тронута. */
+        if (nfd >= 0 && ftruncate(nfd, (off_t)NULLREG_BYTES) != 0) {
+            close(nfd);
+            nfd = -1;
+        }
+        if (nfd >= 0) {
+            void *u1 = mmap((void *)(uintptr_t)0x40000000u,
+                            NULLREG_BYTES, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, nfd, 0);
+
+            if (u1 == MAP_FAILED) {
+                u1 = NULL;
+            } else if ((uintptr_t)u1 != 0x40000000u) {
+                munmap(u1, NULLREG_BYTES);
+                u1 = NULL;
+            }
+
+            /* Кэшируемый вид — тем же файлом на адрес 0; при отказе
+             * (mmap_min_addr) — хотя бы скретчпад 0x10000 со смещением
+             * файла 0x10000; при полном отказе — прежний диагностический
+             * аноним на адрес 0 без согласованности с uncached. */
+            void *c1 = mmap((void *)(uintptr_t)0u, NULLREG_BYTES,
+                            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                            nfd, 0);
+            void *c2 = NULL;
+
+            if (c1 == MAP_FAILED || (uintptr_t)c1 != 0u) {
+                c1 = NULL;
+                c2 = mmap((void *)(uintptr_t)0x10000u, 0x4000u,
+                          PROT_READ | PROT_WRITE, MAP_SHARED, nfd,
+                          (off_t)0x10000u);
+                if (c2 == MAP_FAILED) {
+                    c2 = NULL;
+                } else if ((uintptr_t)c2 != 0x10000u) {
+                    munmap(c2, 0x4000u);
+                    c2 = NULL;
+                }
+                if (c2 == NULL && u1 == NULL) {
+                    void *z = mmap((void *)(uintptr_t)0u, 0x10000u,
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                   -1, 0);
+                    (void)(z == MAP_FAILED);
+                }
+            }
+
+            if (u1 != NULL)
+                m->null_mirror = 0x40000000u;
+            if (c1 != NULL || c2 != NULL)
+                m->scr_base = 0x10000u;
+
+            close(nfd);
+            (void)unlink("/tmp/.psp_guest_null");
+        }
     }
 
     m->memory = p;

@@ -530,6 +530,19 @@ static void report_imports(int fd)
 		put_hex(fd, guest_run_vram_base());
 		PUT(fd, "\n");
 
+		/* Нулевая страница + скретчпад, uncached-вид и кэшируемый.
+		 *
+		 * Прибор к правке по замеру 90: uncached-вид 0x40000000 не
+		 * был отображён, и заливка региона шла 65 537 фолтами до
+		 * убийства потока на границе скретчпада. Ожидаю
+		 * null_mirror=0x40000000 и scr=0x10000; нули — адреса
+		 * заняты, и зона живёт на фолт-эмуляции как раньше. */
+		PUT(fd, "  null_mirror=0x");
+		put_hex(fd, guest_run_null_mirror());
+		PUT(fd, " scr=0x");
+		put_hex(fd, guest_run_scr_base());
+		PUT(fd, "\n");
+
 		/* Куча VPL: где лежит и как работала за прогон.
 		 *
 		 * Прибор к подмене семейства `sceKernel*Vpl`: прогон 35

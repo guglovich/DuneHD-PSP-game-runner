@@ -287,7 +287,7 @@ static void guest_samp_handler(int sig, void *info, void *uc)
 	(void)info;
 	/* Только гостевые потоки, только пока есть лимит:
 	 * чужие (shell) не печатаем, чтобы не искать иголку. */
-	if (g_log_fd < 0 || g_samp_n >= 60 || !guest_thread_fault(tid))
+	if (g_log_fd < 0 || g_samp_n >= 300 || !guest_thread_fault(tid))
 		return;
 	g_samp_n++;
 	early_log("SAMP", tid);
@@ -492,8 +492,25 @@ static int is_implemented(u32 nid)
 	case 0x02D7F94Bu:   /* sceFontFlush */
 	case 0x3AEA8CB6u:   /* sceFontClose */
 	case 0x574B6FBCu:   /* sceFontDoneLib */
-	case 0x293B45B8u:   /* sceKernelGetThreadId — возвращает tid > 0 */
+	case 0x293B45B8u:   /* sceKernelGetThreadId — uid текущего потока */
 	case 0x55C20A00u:   /* sceKernelCreateEventFlag — возвращает uid > 0 */
+	case 0xEF9E4C70u:   /* sceKernelDeleteEventFlag — возврат 0 = успех */
+	case 0x9FA03CD3u:   /* sceKernelDeleteThread — возврат 0 = успех */
+	case 0x278C0DF5u:   /* sceKernelWaitThreadEnd — возврат 0 = конец */
+	case 0x1F4011E6u:   /* sceCtrlSetSamplingMode — возврат 0 = успех */
+	case 0x6A2774F3u:   /* sceCtrlSetSamplingCycle — возврат 0 = успех */
+	case 0x36AA6E91u:   /* sceImposeSetLanguageMode — возврат 0 = успех */
+	case 0xCA04A2B9u:   /* sceKernelRegisterSubIntrHandler — без прерываний */
+	case 0xFB8E22ECu:   /* sceKernelEnableSubIntr — без прерываний */
+	case 0x39AF39A6u:   /* sceNetInit — сеть не нужна, «успех» */
+	case 0x3F7AD767u:   /* sceRtcGetCurrentTick — растущие мкс */
+	case 0xA5DA2406u:   /* sceUtilityGetSystemParamInt — пишет *a1 */
+	case 0x5EC81C55u:   /* sceAudioChReserve — номер канала 0..7 */
+	case 0x6FC46853u:   /* sceAudioChRelease — возврат 0 = успех */
+	case 0x42778A9Fu:   /* __sceSasInit — пишет g_sas[] */
+	case 0xE175EF66u:   /* __sceSasGetOutputmode — режим из g_sas[] */
+	case 0xD5A229C9u:   /* __sceSasRevEVOL — возврат 0 = успех */
+	case 0xF983B186u:   /* __sceSasRevVON — возврат 0 = успех */
 	case 0xE81CAF8Fu:   /* sceKernelCreateCallback — возвращает uid > 0 */
 	case 0x71BC9871u:   /* sceKernelChangeThreadPriority — возврат 0 = успех */
 	case 0xEA748E31u:   /* sceKernelChangeCurrentThreadAttr — возврат 0 = успех */
@@ -539,6 +556,9 @@ static struct {
 	u32 entry[GUEST_THREAD_SLOTS];
 	u32 running[GUEST_THREAD_SLOTS];
 	u32 tid[GUEST_THREAD_SLOTS];
+	u32 calls[GUEST_THREAD_SLOTS];   /* вызовов импортов этим слотом */
+	u32 faults[GUEST_THREAD_SLOTS];  /* сбоев НЕ из нулевой страницы */
+	u32 uid[GUEST_THREAD_SLOTS];     /* PSP uid слота (next_id) */
 	u32 next_id;
 	/* Блок аргументов потока: `args` — длина, `argp` — указатель.
 	 *
@@ -890,6 +910,23 @@ static struct {
 	u32 created;
 } g_ef;
 
+/* --- ЯДРА SAS (sceSasCore) --------------------------------------------
+ *
+ * Замер 90: `__sceSasInit(core, …)` и семейство были нереализованы, и
+ * звуковая подсистема LocoRoco шла по «0 = успех» без какой-либо записи
+ * состояния. Структура ядра для игры opaque (аппаратное состояние, PSP
+ * SDK требует только память выделить), поэтому держим ПАРАМЕТРЫ Init у
+ * себя — их обязаны согласованно возвращать GetOutputmode и Rev*. */
+#define SAS_CORES		4u
+
+static struct {
+	u32 core;    /* указатель ядра в памяти гостя; 0 = слот свободен */
+	u32 grain;
+	u32 voices;
+	u32 mode;
+	u32 rate;
+} g_sas[SAS_CORES];
+
 /* --- ОБРАТНЫЕ ВЫЗОВЫ sceKernel*Callback ------------------------------
  *
  * `sceKernelCreateCallback` возвращает uid > 0. Игра может использовать
@@ -996,16 +1033,18 @@ static int scan_threads(u32 *out, int max)
 static void cbk_sample(void)
 {
 	static u32 tick;
+	static u32 samp_tick;   /* накопительный: GAT-детектор */
 	static u32 first_list = 1;
 	static u32 gone_done;
 	u32 self = (u32)plat_gettid();
 	u32 pid = (u32)plat_getpid();
 	u32 slot;
 
-	if (++tick < 40)
+	if (++tick < 2)
 		return;
 	tick = 0;
-	if (g_samp_n >= 60)
+	samp_tick++;
+	if (g_samp_n >= 300)
 		return;
 	if (pid == 0)
 		return;
@@ -1041,7 +1080,15 @@ static void cbk_sample(void)
 				gone_done |= 1u << slot;
 				early_log("GONE!", g_thread.entry[slot]);
 				early_log("GTID", tid);
-				early_log("GAT", tick);
+				/* Накопительный тик: прежний GAT печатал
+				 * ЛОКАЛЬНЫЙ tick, обнуляемый при каждом
+				 * вызове, — всегда 0. Замеры 74–80: GAT
+				 * не отличал «первый тик» от «сотого». */
+				early_log("GAT", samp_tick * 2u);
+				early_log("GCALL", (u32)g_guest_calls);
+				/* Счётчик вызовов ИМЕННО этого слота:
+				 * кто сколько сделал до смерти. */
+				early_log("GTCL", g_thread.calls[slot]);
 			}
 		}
 		for (i = 0; i < n; i++) {
@@ -1211,6 +1258,7 @@ static u32 thread_created(u32 entry)
 		if (g_thread.running[slot] == 0 && g_thread.entry[slot] == 0) {
 			g_thread.entry[slot] = entry;
 			g_thread.next_id++;
+			g_thread.uid[slot] = g_thread.next_id;
 			return g_thread.next_id;   /* `$a1` — адрес входа, `$a0` — имя */
 		}
 	}
@@ -1659,6 +1707,22 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	g_guest_calls++;
 	if (index >= g_hle_count)
 		return 0;
+	/* Per-thread счётчик вызовов: по tid → слот.
+	 * Замер 81: главный умер при g_guest_calls=290, но СКОЛЬКО
+	 * вызовов сделал он — неизвестно (глобальный счётчик
+	 * смешивает потоки). Это число печатает GTCL при GONE. */
+	{
+		u32 ctid = (u32)plat_gettid();
+		u32 slot2;
+
+		for (slot2 = 0; slot2 < GUEST_THREAD_SLOTS; slot2++) {
+			if (g_thread.tid[slot2] != 0
+			    && g_thread.tid[slot2] == ctid) {
+				g_thread.calls[slot2]++;
+				break;
+			}
+		}
+	}
 	if (g_run.calls >= CALL_LIMIT) {
 		g_run.limit_hit = 1;
 		g_guest_finished = 1;
@@ -2074,7 +2138,17 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 		} else {
 			g_vpl.fails++;
 		}
-		return 0;
+		/* ВОЗВРАЩАЕМ УКАЗАТЕЛЬ, НЕ 0.
+		 *
+		 * На PSP AllocateVpl/CB возвращает базу блока в `$v0`.
+		 * Прежний `return 0` давал гостю NULL: он читал `$v0` как
+		 * указатель и писал в `NULL | 0x40000000` (uncached-бит) —
+		 * это ровно те 129 memset-фолтов на 0x40000000-0x4000007B,
+		 * которые фолт-хендлер «успешно» пропускал, теряя данные.
+		 * Отыскано трассировкой GJRA: главный гиб после
+		 * AllocateVplCB → журнал → memset(NULL+uncached) →
+		 * чтение потерянных нулей → смерть в чистом коде. */
+		return block;
 	}
 
 	if (nid == 0x39810265u) {   /* sceKernelReferVplStatus */
@@ -2137,10 +2211,25 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 		return 0;
 
 	if (nid == 0x293B45B8u) {   /* sceKernelGetThreadId */
-		u32 tid = (args != NULL) ? args[0] : 0;
-		/* Вернуть tid > 0: игра проверяет, существует ли поток.
-		 * Ноль означает «потока нет», и игра останавливается. */
-		return (tid != 0) ? tid : 1;
+		/* Замер 90 (652ee635): прежний возврат `args[0]` — ЭХО
+		 * случайного `$a0` вызывающего. У обёртки 0x08AB69A8
+		 * аргументов нет, и в `$a0` оставалось всё, что было:
+		 * известен случай 0xC6600BC0 (kseg2 — вообще не
+		 * пользовательский адрес), который игра унесла в свои
+		 * структуры. По контракту PSP вызов возвращает uid
+		 * ТЕКУЩЕГО потока — ищем слот по tid. Не нашли
+		 * (module_start-поток создан нами, не игрой) — 1. */
+		{
+			u32 now = (u32)plat_gettid();
+			u32 gslot;
+
+			for (gslot = 0; gslot < GUEST_THREAD_SLOTS; gslot++) {
+				if (g_thread.tid[gslot] != 0
+				    && g_thread.tid[gslot] == now)
+					return g_thread.uid[gslot];
+			}
+		}
+		return 1;
 	}
 
 	if (nid == 0x55C20A00u) {   /* sceKernelCreateEventFlag */
@@ -2174,6 +2263,37 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 		 * 0x088C1714): главный прожил три чётных вызова
 		 * (журнал молчал) и умер на четвёртом. На PSP без
 		 * зажатого HOLD GetGPI возвращает «hold off». */
+		/* ЖУРНАЛ-ТРАССИРОВКА: ra=088C1714 — вызов ИЗ журнала.
+		 * Кто ВЫЗВАЛ журнал: в прологе журнала `sw ra,12(sp)`
+		 * — адрес возврата в вызывающего лежит по
+		 * guest_sp+12. Тримплин кладёт args[] на
+		 * guest_sp-64+8, значит guest_sp = args + 56.
+		 * Первые 4 журнала печатаем ra вызова — точка,
+		 * после которой поток гибнет. */
+		if (ra == 0x088C1714u) {
+			static u32 gj_n;
+			if (g_log_fd >= 0 && gj_n < 32) {
+				u32 gsp = (u32)(uintptr_t)args + 56u;
+
+				/* Стек ГОСТЯ (g_thread_stack/g_worker_stack) —
+				 * В НАШЕМ .so, адрес 0x2Dxxxxxx — а НЕ в
+				 * отображении образа гостя. Прошлая проверка
+				 * `gsp < base+map_size` его НЕ ПРОПУСКАЛА
+				 * (замер 83: GJRA пусто при 58 GetGPI).
+				 * Читаем ПРЯМЫМ указателем.
+				 *
+				 * gj_n < 32: в цикле загрузки модулей 6
+				 * журналов, в init — ещё ~10, и ФИНАЛЬНЫЕ
+				 * три — которые нас интересуют. 32 покрывает
+				 * все с запасом. */
+				if (gsp > 0x1000u && gsp < 0x80000000u) {
+					u32 jra = *(const u32 *)
+					    (uintptr_t)(gsp + 12);
+					early_log("GJRA", jra);
+					gj_n++;
+				}
+			}
+		}
 		return 0;
 	}
 
@@ -2294,10 +2414,19 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	}
 
 	if (nid == 0x9ACE131Eu) {   /* sceKernelSleepThread */
-		/* НЕ-CB-вариант: колбеки НЕ исполняются, но поток
-		 * должен просыпаться по флагу (воркеры очереди задач
-		 * 0x325C08 крутят `while(!head) SleepThread()`).
-		 * 10-мс поллинг: поток жив, CPU не жжёт. */
+		/* Прогон 80: семпля главного потока показывают его
+		 * ВНУТРИ plat_sleep_ms (0x668C вход / 0x66E4 возврат
+		 * из nanosleep) — ПОСЛЕ того как ранний лог (1000
+		 * записей) исчерпан и его вызовы НЕВИДИМЫ.
+		 * Значит главный жил после журнала×3 и КРУТИЛ
+		 * цикл с парком. Какой парк — расшифровываем
+		 * первыми 16 вызовами SleepThread С TID. */
+		static u32 dbg_n;
+		if (g_log_fd >= 0 && dbg_n < 16) {
+			dbg_n++;
+			early_log("STX", (u32)plat_gettid());
+			early_log("STR", ra);
+		}
 		plat_sleep_ms(10);
 		return 0;
 	}
@@ -2547,7 +2676,18 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 		 * Wait/Signal крутилась 18.2M раз за 30 с (одинаково
 		 * поровну — спин), CPU съедался у партнёра-потока.
 		 * 1 мс на вызов заставляет пару честно ждать и
-		 * высвобождает CPU остальным потокам. */
+		 * высвобождает CPU остальным потокам.
+		 *
+		 * Прогон 81: главный ЖИЛ 17+ секунд ПОСЛЕ журнала×3
+		 * (GCALL=290), семплировался в ЭТОМ парке, потом
+		 * умер (GAT=10). Какой WaitSema-цикл — расшифровка
+		 * первыми 16 вызовами с tid и ra. */
+		static u32 dbg_n;
+		if (g_log_fd >= 0 && dbg_n < 16) {
+			dbg_n++;
+			early_log("WSX", (u32)plat_gettid());
+			early_log("WSR", ra);
+		}
 		plat_sleep_ms(1);
 		return 0;
 	}
@@ -2556,8 +2696,19 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 		/* a0 — МИКРОСЕКУНДЫ. Прогресса 63: мгновенный возврат
 		 * крутил таймерный цикл 0x088C17B0 в паре с
 		 * WaitVblank/GetTimeWide по 4.5M итераций (180k/с).
-		 * Скругление вверх до мс; 0 — без сна. */
+		 * Скругление вверх до мс; 0 — без сна.
+		 *
+		 * Прогон 80: главный спал в plat_sleep_ms — а его
+		 * DelayThread-вызовы (если были) за пределами
+		 * раннего лога. Логируем первые 16 с tid и a0. */
+		static u32 dbg_n;
 		u32 us = (args != NULL) ? args[0] : 0;
+		if (g_log_fd >= 0 && dbg_n < 16) {
+			dbg_n++;
+			early_log("DTX", (u32)plat_gettid());
+			early_log("DTR", ra);
+			early_log("DTU", us);
+		}
 		if (us == 0)
 			return 0;
 		plat_sleep_ms((us + 999u) / 1000u);
@@ -2565,6 +2716,83 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	}
 
 	if (nid == 0x3F53E640u)     /* sceKernelSignalSema — возврат 0 = успех */
+		return 0;
+
+	/* --- Замер 90 (652ee635): звуковая инициализация LocoRoco шла
+	 * по нереализованным вызовам, и «0 = успех» дефолта НЕ весь
+	 * безобиден: у вызовов с OUT-АРГУМЕНТОМ игра читает из своей
+	 * переменной мусор, потому что заглушка туда не писала.
+	 * Ниже — минимально PSP-истинные ответы по факту вызовов
+	 * прогона (см. docs/launcher-state.md, замер 90). --- */
+
+	if (nid == 0x3F7AD767u) {   /* sceRtcGetCurrentTick — мкс, растут */
+		g_time_us += 1000u;
+		return g_time_us;
+	}
+
+	if (nid == 0xA5DA2406u) {   /* sceUtilityGetSystemParamInt */
+		/* (id, out): пишем *out = 1. Для id 9 (громкость) это
+		 * «включено»; язык и прочие id в этом прогоне не
+		 * спрашивались. Без записи *out игра читала мусор. */
+		if (args != NULL && args[1] != 0)
+			guest_write_u32(args[1], 1u);
+		return 0;
+	}
+
+	if (nid == 0x5EC81C55u) {   /* sceAudioChReserve — выделить канал */
+		/* Замер 90: 4 вызова с a0=FFFFFFFF (авто-выбор), каждый
+		 * получал 0 — четыре «канала 0». По контракту PSP
+		 * возвращается НОМЕР канала (0..7), все разные. */
+		static u32 audio_next;
+		u32 ch = audio_next++;
+
+		if (audio_next > 8u)
+			audio_next = 8u;
+		if (ch > 7u)
+			return 0x80000000u;   /* PSP_AUDIO_ERROR_NOT_FOUND */
+		return ch;
+	}
+
+	if (nid == 0x6FC46853u)     /* sceAudioChRelease — возврат 0 = успех */
+		return 0;
+
+	if (nid == 0x42778A9Fu) {   /* __sceSasInit(core, grain, voices, mode, rate) */
+		/* Ядро SAS для игры OPAQUE (структура — аппаратное
+		 * состояние), но параметры запоминаем: GetOutputmode и
+		 * Rev* обязаны отвечать согласованно с Init. */
+		u32 i;
+
+		for (i = 0; i < SAS_CORES; i++) {
+			if (g_sas[i].core == 0
+			    || g_sas[i].core == (args != NULL ? args[0] : 0)) {
+				g_sas[i].core = (args != NULL) ? args[0] : 0;
+				g_sas[i].grain = (args != NULL) ? args[1] : 0;
+				g_sas[i].voices = (args != NULL) ? args[2] : 0;
+				g_sas[i].mode = (args != NULL) ? args[3] : 0;
+				g_sas[i].rate = (args != NULL) ? args[4] : 0;
+				break;
+			}
+		}
+		return 0;
+	}
+
+	if (nid == 0xE175EF66u) {   /* __sceSasGetOutputmode(core) */
+		u32 i;
+
+		for (i = 0; i < SAS_CORES; i++)
+			if (g_sas[i].core != 0
+			    && g_sas[i].core == (args != NULL ? args[0] : 1u))
+				return g_sas[i].mode;
+		return 0;   /* PSP_SAS_OUTPUTMODE_MIXED */
+	}
+
+	if (nid == 0xD5A229C9u)     /* __sceSasRevEVOL — возврат 0 = успех */
+		return 0;
+
+	if (nid == 0xF983B186u)     /* __sceSasRevVON — возврат 0 = успех */
+		return 0;
+
+	if (nid == 0x278C0DF5u)     /* sceKernelWaitThreadEnd — поток уже завершён */
 		return 0;
 
 	if (!is_implemented(nid))
@@ -3623,27 +3851,58 @@ static void guest_fault_handler(int sig, void *info, void *uc)
 	 *
 	 * Предел обязателен: без него гость, зациклившийся на одном обращении,
 	 * крутился бы вечно и держал `dlclose` при живом коде.
-	 * Счётчик увеличен выше, до печати. */
-	if (g_fault_total > FAULT_RECOVER_MAX) {
-		if (g_log_fd >= 0) {
-			char cb[48];
-			int ci = 0, ck;
+	 * Счётчик увеличен выше, до печати.
+	 *
+	 * Замер 89 (bd18dff0) изменил ДВЕ вещи в этом пределе:
+	 *
+	 * 1. Сбои НУЛЕВОЙ страницы (все 4 зеркала PSP, `(addr &
+	 *    0x3FFFFFFF) < 0x10000`) в предел НЕ входят. memset
+	 *    316 байт по 0x40000000 — это 316 ПОБАЙТОВЫХ сбоев,
+	 *    каждый из которых обработчик ниже честно эмулирует;
+	 *    прежде 129-й из них убивал главный поток посреди
+	 *    заливки (FAULTCAP=81, GONE!=08A9C958). Тот же
+	 *    принцип уже применён в SPINDEAD ниже.
+	 * 2. Предел стал НА ПОТОК, а не общий: `g_fault_total`
+	 *    считался на всех потоках сразу, и невинный поток
+	 *    умирал за чужой шторм. Считает `g_thread.faults[]`
+	 *    по слоту текущего tid; для потока вне таблицы —
+	 *    прежний общий счётчик. */
+	{
+		u32 fslot;
+		int have_fslot = 0;
 
-			cb[ci++] = ' ';
-			cb[ci++] = 'F'; cb[ci++] = 'A'; cb[ci++] = 'U';
-			cb[ci++] = 'L'; cb[ci++] = 'T'; cb[ci++] = 'C';
-			cb[ci++] = 'A'; cb[ci++] = 'P'; cb[ci++] = '=';
-			for (ck = 7; ck >= 0; ck--)
-				cb[ci++] = digits[(g_fault_total >> (ck * 4)) & 0xF];
-			cb[ci++] = ' ';
-			cb[ci++] = 's'; cb[ci++] = 'k'; cb[ci++] = 'i';
-			cb[ci++] = 'p'; cb[ci++] = ' '; cb[ci++] = '=';
-			for (ck = 7; ck >= 0; ck--)
-				cb[ci++] = digits[(g_fault_skipped >> (ck * 4)) & 0xF];
-			cb[ci++] = '\n';
-			(void)plat_write(g_log_fd, cb, (size_t)ci);
+		if ((ad_v & 0x3FFFFFFFu) >= 0x10000u) {
+			for (fslot = 0; fslot < GUEST_THREAD_SLOTS; fslot++) {
+				if (g_thread.tid[fslot] != 0
+				    && g_thread.tid[fslot] == (u32)plat_gettid()) {
+					g_thread.faults[fslot]++;
+					have_fslot = 1;
+					break;
+				}
+			}
+			if ((have_fslot && g_thread.faults[fslot] > FAULT_RECOVER_MAX)
+			    || (!have_fslot && g_fault_total > FAULT_RECOVER_MAX)) {
+				if (g_log_fd >= 0) {
+					char cb[64];
+					int ci = 0, ck;
+
+					cb[ci++] = ' ';
+					cb[ci++] = 'F'; cb[ci++] = 'A'; cb[ci++] = 'U';
+					cb[ci++] = 'L'; cb[ci++] = 'T'; cb[ci++] = 'C';
+					cb[ci++] = 'A'; cb[ci++] = 'P'; cb[ci++] = '=';
+					for (ck = 7; ck >= 0; ck--)
+						cb[ci++] = digits[(g_fault_total >> (ck * 4)) & 0xF];
+					cb[ci++] = ' ';
+					cb[ci++] = 's'; cb[ci++] = 'k'; cb[ci++] = 'i';
+					cb[ci++] = 'p'; cb[ci++] = ' '; cb[ci++] = '=';
+					for (ck = 7; ck >= 0; ck--)
+						cb[ci++] = digits[(g_fault_skipped >> (ck * 4)) & 0xF];
+					cb[ci++] = '\n';
+					(void)plat_write(g_log_fd, cb, (size_t)ci);
+				}
+				plat_thread_exit();
+			}
 		}
-		plat_thread_exit();
 	}
 
 	/* Обрыв по «подряд на этом pc» — ПОСЛЕ печати компактной строки сбоя,
@@ -4518,6 +4777,85 @@ int guest_run_start(GuestModule *m, const GuestImportTable *t, int log_fd)
 	if (!install_trampolines(t, (u32)(uintptr_t)&guest_import))
 		return -2;
 
+	/* СГS-ДИАГНОСТИКА: структура 316-байтных элементов.
+	 *
+	 * Прогоны 86: 5 новых SIGBUS в 0x08AB-зоне — гость
+	 * читает sparse-массив (элементы 0x13C байт) по цепочке
+	 * `база+4 → массив`, `база+8 → count`, `элемент+4 →
+	 * подобъект`, `элемент+12 → индекс`, и подобъект-база
+	 * приходит мусорной (NULL/-1). Пара lui/addiu на
+	 * 0x08AB202C/0x08AB2034 (file vaddr 0x2AE02C/34)
+	 * указывает на БАЗУ — после релокаций читаем её
+	 * прямо из образа.
+	 *
+	 * Замер 89 (сборка bd18dff0): прежняя формула добавляла
+	 * `+4` к старшей половине и давала 0x08BEEFDC — на
+	 * 0x40000 выше реальной базы. Релоцированная пара
+	 * вычисляет hi=0x8BB, lo=0xEFDC (знаково −0x1024):
+	 * (0x8BB<<16) − 0x1024 = 0x08BAEFDC — .bss внутри
+	 * RW-сегмента (0x08B91840..0x08BBB6EC), за file-концом
+	 * сегмента, то есть таблица изначально нулевая. Тот же
+	 * адрес виден в дампе кадра сбоя (R20=0x08BAEFDC).
+	 * Заправка по смещённой базе уходила в часть-арену
+	 * (0x08BEEFDC ≥ 0x08BCC000) впустую: реальная таблица
+	 * оставалась пустой, диспетчер аллокатора (0x08A38180)
+	 * получал 0 от обоих бэкендов и шёл заливать
+	 * memset(uncached(NULL)=0x40000000, 0, 0x13C). */
+	if (g_log_fd >= 0 && g_mod != 0 && g_mod->memory != 0) {
+		u32 hi_v, lo_v, base;
+		u32 va_hi = 0x08AB202Cu - g_mod->base;
+		u32 va_lo = 0x08AB2034u - g_mod->base;
+
+		hi_v = *(const u32 *)((const unsigned char *)g_mod->memory + va_hi);
+		lo_v = *(const u32 *)((const unsigned char *)g_mod->memory + va_lo);
+		base = ((hi_v & 0xFFFF) << 16) + ((s32)(s16)(lo_v & 0xFFFF));
+		early_log("SGSB", base);
+		/* Поля структуры: +4 = массив, +8 = count */
+		early_log("SGSA", *(const u32 *)((const unsigned char *)g_mod->memory + base - g_mod->base + 4));
+		early_log("SGSN", *(const u32 *)((const unsigned char *)g_mod->memory + base - g_mod->base + 8));
+
+		/* ЗАПОЛНЯЕМ СТРУКТУРУ МИНИМАЛЬНО-ВАЛИДНЫМИ ДАННЫМИ.
+		 *
+		 * Замер 87: SGSA=0, SGSN=0 — таблица ПУСТАЯ. На ПСП её
+		 * заполняет ЗАГРУЖЕННЫЙ МОДУЛЬ (SAS/Atrac, попавший на
+		 * 0x08BE0000-зону через LoadModule). Наша заглушка
+		 * LoadModule «успех» ничего не грузит — 5 SIGBUS
+		 * (0x08AB0C28..0x08AB20AC) гибнут на NULL-подобъектах.
+		 *
+		 * Заполняем: массив = part_alloc(64КБ), count=1,
+		 * элемент[0]: +4 = подобъект-база (part_alloc 316б),
+		 * +12 = индекс 0. Гость читает валидную таблицу. */
+		{
+			u32 arr_off = base - g_mod->base + 4;
+			u32 cnt_off = base - g_mod->base + 8;
+			u32 arr, elem, sub;
+			u32 arr_uid, sub_uid;
+			unsigned char *mem = (unsigned char *)g_mod->memory;
+
+			/* part_alloc возвращает ДЕСКРИПТОР (slot+1),
+			 * НЕ указатель! Замер 88: SGSF=1, SGSS=2 — гость
+			 * прочитал их как адреса → фолты по 1. Указатель
+			 * даёт part_head(дескриптор) — как в PSP-контракте
+			 * AllocPartitionMemory → GetBlockHeadAddr. */
+			arr_uid = part_alloc(64 * 1024);
+			sub_uid = part_alloc(0x13C);
+			arr = part_head(arr_uid);
+			sub = part_head(sub_uid);
+			if (arr != 0 && sub != 0) {
+				elem = arr;
+				*(u32 *)(mem + arr_off) = arr;
+				*(u32 *)(mem + cnt_off) = 1;
+				/* элемент[0] = 16 байт: +4 подобъект-база,
+				 * +8 ?, +12 индекс */
+				*(u32 *)(mem + elem - g_mod->base + 4) = sub;
+				*(u32 *)(mem + elem - g_mod->base + 8) = 0;
+				*(u32 *)(mem + elem - g_mod->base + 12) = 0;
+				early_log("SGSF", arr);
+				early_log("SGSS", sub);
+			}
+		}
+	}
+
 	sp_top = (unsigned long)&g_thread_stack[sizeof(g_thread_stack)];
 	/* Второй аргумент — указатель на вершину стека потока: именно его
 	 * `plat_clone` кладёт в `$sp` ребёнка. Передаётся как значение, а не
@@ -5021,6 +5359,17 @@ u32 guest_run_fb_dumps(void) { return g_fb_dumps; }
 u32 guest_run_vram_base(void)
 {
 	return (g_mod != NULL) ? g_mod->vram_base : 0;
+}
+
+/* Нулевая страница + скретчпад: приборы к правке по замеру 90. */
+u32 guest_run_null_mirror(void)
+{
+	return (g_mod != NULL) ? g_mod->null_mirror : 0;
+}
+
+u32 guest_run_scr_base(void)
+{
+	return (g_mod != NULL) ? g_mod->scr_base : 0;
 }
 
 /* --- куча VPL: приборы к подмене семейства `sceKernel*Vpl` --- */

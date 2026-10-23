@@ -112,6 +112,12 @@ u32  guest_run_fb_count(void);
 u32  guest_run_fb_dumps(void);
 u32  guest_run_vram_base(void);
 
+/* Нулевая страница + скретчпад (замер 90): uncached-вид 0x40000000 и
+ * кэшируемый скретчпад 0x10000. Нули — адреса заняты, зона на
+ * фолт-эмуляции. */
+u32  guest_run_null_mirror(void);
+u32  guest_run_scr_base(void);
+
 /* Куча VPL: адреса области и приборы к подмене семейства
  * `sceKernel*Vpl` (прогон 35: без адреса блока гость падал в
  * `HeapSystem`). 0 у `vpl_base` — области нет, `MaxFreeMemSize`
