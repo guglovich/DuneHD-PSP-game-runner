@@ -276,6 +276,11 @@ static u32 g_samp_n;   /* лимит напечатанных семплов */
 static int guest_thread_fault(u32 tid);   /* определён ниже */
 static void early_log(const char *tag, u32 v);
 
+/* Замер 100: дренажный клапан — счётчик семплов внутри цикла дренажа
+ * (заполняется обработчиком ниже, читается паркером SleepThreadCB). */
+volatile u32  g_drain_spin;
+static u32    g_drain_valve;
+
 static void guest_samp_handler(int sig, void *info, void *uc)
 {
 	static const unsigned short off[] = { 0x10, 0x20, 0x28, 0x40, 0xF0 };
@@ -292,9 +297,19 @@ static void guest_samp_handler(int sig, void *info, void *uc)
 	g_samp_n++;
 	early_log("SAMP", tid);
 	for (k = 0; k < 5; k++) {
+		u32 v;
+
 		p = (const unsigned char *)uc + off[k];
-		early_log("SP", (u32)p[0] | ((u32)p[1] << 8)
-		          | ((u32)p[2] << 16) | ((u32)p[3] << 24));
+		v = (u32)p[0] | ((u32)p[1] << 8)
+		    | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+		early_log("SP", v);
+		/* Замер 100: детектор спина дренажа — цикл
+		 * 0x08AB43D0..E8 крутится, пока счётчик [obj+0x278]
+		 * не опустошится, а опустошить его некому (sparse-
+		 * таблица голосов пуста). Паркер по этому счётчику
+		 * открывает дренажный клапан. */
+		if (v >= 0x08AB43C8u && v <= 0x08AB43ECu)
+			g_drain_spin++;
 	}
 }
 volatile int  g_guest_finished;
@@ -2573,6 +2588,37 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 
 			if (ab_deliver)
 				cbk_deliver();
+			/* ДРЕНАЖНЫЙ КЛАПАН (замер 100): если семплер трижды
+			 * видел цикл дренажа 0x08AB43C8..EC — игра стоит в
+			 * livelock из-за пустой sparse-таблицы голосов.
+			 * Один раз заполняем её минимально-валидной
+			 * записью (массив part_alloc 64К + один 316-байт
+			 * подобъект, count=1) — тик 0x08AB6228 получит
+			 * элемент, путь завершения 0x08AB2CB8 декрементирует
+			 * счётчик, дренаж пойдёт. */
+			if (g_drain_spin >= 3u && g_drain_valve == 0
+			    && g_mod != 0 && g_mod->memory != 0) {
+				u32 arr = part_head(part_alloc(64u * 1024u));
+				u32 sub = part_head(part_alloc(0x13Cu));
+				u32 tbl = 0x08BAEFDCu;
+
+				if (arr != 0 && sub != 0
+				    && tbl > g_mod->base
+				    && tbl + 16u < g_mod->base + g_mod->map_size) {
+					unsigned char *mem =
+					    (unsigned char *)g_mod->memory;
+
+					*(u32 *)(mem + tbl + 4u - g_mod->base) = arr;
+					*(u32 *)(mem + tbl + 8u - g_mod->base) = 1u;
+					*(u32 *)(mem + arr - g_mod->base + 4u) = sub;
+					*(u32 *)(mem + arr - g_mod->base + 8u) = 0;
+					*(u32 *)(mem + arr - g_mod->base + 12u) = 0;
+					g_drain_valve = 1u;
+					early_log("DVA", arr);
+					early_log("DVS", sub);
+				}
+				g_drain_spin = 0;
+			}
 			cbk_sample();
 			plat_sleep_ms(15);
 		}
