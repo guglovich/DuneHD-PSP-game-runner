@@ -305,9 +305,28 @@ static void guest_samp_handler(int sig, void *info, void *uc)
 
 	(void)sig;
 	(void)info;
-	/* Только гостевые потоки, только пока есть лимит:
-	 * чужие (shell) не печатаем, чтобы не искать иголку. */
-	if (g_log_fd < 0 || g_samp_n >= 300 || !guest_thread_fault(tid))
+	/* Только гостевые потоки. Печать — по бюджету (300), но
+	 * ЗАХВАТЫ указателей (дренаж/движок, замеры 111-112) идут
+	 * ВСЕГДА: бюджет съедается boot-фазой раньше стационара.
+	 */
+	if (g_log_fd < 0 || !guest_thread_fault(tid))
+		return;
+	for (k = 0; k < 5; k++) {
+		u32 v;
+
+		p = (const unsigned char *)uc + off[k];
+		v = (u32)p[0] | ((u32)p[1] << 8)
+		    | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+		if (v >= 0x08AB43C8u && v <= 0x08AB43ECu) {
+			g_drain_spin++;
+			g_drain_obj = *(const u32 *)
+			    ((const unsigned char *)uc + 40 + 8 * 16);
+		}
+		if (v >= 0x08AB6CC0u && v <= 0x08AB6D40u)
+			g_engine_obj = *(const u32 *)
+			    ((const unsigned char *)uc + 40 + 8 * 4);
+	}
+	if (g_samp_n >= 300)
 		return;
 	g_samp_n++;
 	early_log("SAMP", tid);
