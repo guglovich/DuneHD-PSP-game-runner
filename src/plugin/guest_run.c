@@ -293,6 +293,7 @@ static u32    g_drain_marks;
 static volatile u32 g_sound_sema;  /* uid звукового семафора (замер 108) */
 static u32    g_sound_signals;
 static volatile u32 g_engine_obj;  /* $a0 цикла движка (замер 111) */
+static volatile u32 g_engine_s0;   /* $s0 в горячем цикле (замер 113) */
 static u32    g_engine_dumped;
 static volatile u32 g_engine_tid;  /* tid ждущего звуков. семафор (112) */
 static u32    g_drain_dumped;  /* 1 = дамп объекта уже сделан */
@@ -351,10 +352,16 @@ static void guest_samp_handler(int sig, void *info, void *uc)
 			g_drain_obj = *(const u32 *)((const unsigned char *)uc
 			                          + 40 + 8 * 16);
 		}
-		/* Замер 111: цикл движка 0x08AB6CC0..D40 — 25 млн
-		 * итераций на пустой очереди, PC там почти всегда.
-		 * $a0 = gregs[4] — ОБЪЕКТ ДВИЖКА (очередь: [+4] массив
-		 * 20-байт элементов, [+8] count). */
+		/* Замер 113: горячий цикл движка — АКСЕССУАР
+		 * 0x08AB7228..60 (25М вызовов, [obj+0]==0 всегда) и
+		 * соседние зоны. $a0 = gregs[4] — опрашиваемый объект;
+		 * $s0 = gregs[16] — контекст вызова. Берём оба. */
+		if (v >= 0x08AB7228u && v <= 0x08AB7260u) {
+			g_engine_obj = *(const u32 *)
+			    ((const unsigned char *)uc + 40 + 8 * 4);
+			g_engine_s0 = *(const u32 *)
+			    ((const unsigned char *)uc + 40 + 8 * 16);
+		}
 		if (v >= 0x08AB6CC0u && v <= 0x08AB6D40u)
 			g_engine_obj = *(const u32 *)((const unsigned char *)uc
 			                      + 40 + 8 * 4);
@@ -5455,6 +5462,7 @@ void guest_run_wait(u32 want, u32 max_ms)
 
 			g_engine_dumped = 1u;
 			early_log("EGO", g_engine_obj);
+			early_log("EGS", g_engine_s0);
 			for (wk = 0; wk < 16u; wk++) {
 				u32 ad = g_engine_obj + 4u * wk;
 
