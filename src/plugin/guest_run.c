@@ -5438,6 +5438,34 @@ void guest_run_wait(u32 want, u32 max_ms)
 			}
 			if (guest_addr_direct_ok(fld)
 			    && *(volatile u32 *)(uintptr_t)fld == 0u) {
+				u32 bufp = *(volatile u32 *)(uintptr_t)(obj + 0x280u);
+
+				/* Замер 110: рабочий путь аксессуара
+				 * (0x08AB7250) читает [obj+0x280] как
+				 * УКАЗАТЕЛЬ БУФЕРА грейна и зовёт
+				 * 0x08AB60B0(buf, 1). С нулём процессор
+				 * no-op'ается — 25 млн пустых циклов
+				 * Wait/Signal (ra 08AB60D0/6104).
+				 * Выдаём валидный буфер: грейн 2048
+				 * × 2 канала × 2 байта = 8 КиБ нулей
+				 * (тишина). part_alloc обнуляет страницу
+				 * лишь в первый раз — обнуляем сами. */
+				if (bufp == 0u) {
+					u32 buf = part_head(part_alloc(8192u));
+
+					if (buf != 0
+					    && g_mod != 0 && g_mod->memory != 0) {
+						u32 i;
+
+						for (i = 0; i < 8192u; i += 4u)
+							*(volatile u32
+							  *)(uintptr_t)(buf + i) = 0u;
+						*(volatile u32 *)(uintptr_t)
+						    (obj + 0x280u) = buf;
+						if (g_log_fd >= 0)
+							early_log("GRB", buf);
+					}
+				}
 				*(volatile u32 *)(uintptr_t)fld = 1u;
 				g_drain_marks++;
 				if (g_drain_marks <= 16u && g_log_fd >= 0)
