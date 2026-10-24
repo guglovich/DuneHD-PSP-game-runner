@@ -277,9 +277,19 @@ static int guest_thread_fault(u32 tid);   /* определён ниже */
 static void early_log(const char *tag, u32 v);
 
 /* Замер 100: дренажный клапан — счётчик семплов внутри цикла дренажа
- * (заполняется обработчиком ниже, читается паркером SleepThreadCB). */
+ * (заполняется обработчиком ниже, читается паркером SleepThreadCB).
+ *
+ * Замер 103: SOFTWARE GRAIN COMPLETER. По PPSSPP (Core/HW/SasAudio.h)
+ * SAS — не фиксированное железо, а ПРОГРАММНЫЙ микшер на Media Engine:
+ * игра ставит грейн в очередь, ME микшует и помечает буфер готовым,
+ * аксессуар 0x08AB7228 потребляет пометку. ME у нас нет — семплер
+ * снимает $s0 цикла дренажа (сам объект), а насос тика каждые ~46 мс
+ * (грейн 2048/44100) помечает буфер готовым: [obj+0x27C]=1. Это шаг
+ * «научиться вызовам» перед оффлоадом на DSP плеера. */
 volatile u32  g_drain_spin;
 static u32    g_drain_valve;
+volatile u32  g_drain_obj;     /* $s0 цикла дренажа, снятый семплером */
+static u32    g_drain_marks;
 
 static void guest_samp_handler(int sig, void *info, void *uc)
 {
@@ -308,8 +318,13 @@ static void guest_samp_handler(int sig, void *info, void *uc)
 		 * не опустошится, а опустошить его некому (sparse-
 		 * таблица голосов пуста). Паркер по этому счётчику
 		 * открывает дренажный клапан. */
-		if (v >= 0x08AB43C8u && v <= 0x08AB43ECu)
+		if (v >= 0x08AB43C8u && v <= 0x08AB43ECu) {
 			g_drain_spin++;
+			/* $s0 = gregs[16] — объект дренажа (цикл держит
+			 * его в $s0 всё время: move s0,a0 в прологе). */
+			g_drain_obj = *(const u32 *)((const unsigned char *)uc
+			                          + 40 + 8 * 16);
+		}
 	}
 }
 volatile int  g_guest_finished;
@@ -5320,6 +5335,29 @@ void guest_run_wait(u32 want, u32 max_ms)
 		 * входов: SIE без SIX = обработчик не вернулся. */
 		if ((ms & 15u) == 0u)
 			si_fire();
+		/* Грэйн-комплитер: раз в ~46 мс (60 Гц тик ×3 ≈ грейн
+		 * 2048 сэмплов на 44100) пометить буфер дренажа
+		 * готовым, как это сделал бы Media Engine. Поле
+		 * [obj+0x27C] — аргумент аксессуара 0x08AB7228
+		 * (addiu s1,a0,636 в цикле 0x08AB43D0). */
+		if ((ms % 46u) == 0u && g_drain_obj != 0
+		    && g_mod != 0 && g_mod->memory != 0) {
+			u32 obj = g_drain_obj;
+			u32 fld = obj + 0x27Cu;
+
+			if (fld >= g_mod->base
+			    && fld + 4u <= g_mod->base + g_mod->map_size) {
+				unsigned char *mem =
+				    (unsigned char *)g_mod->memory;
+
+				if (*(u32 *)(mem + fld - g_mod->base) == 0u) {
+					*(u32 *)(mem + fld - g_mod->base) = 1u;
+					g_drain_marks++;
+					if (g_drain_marks <= 16u && g_log_fd >= 0)
+						early_log("GRM", obj);
+				}
+			}
+		}
 		plat_sleep_ms(1);
 	}
 	/* Окно закрыто: обработчик снят сразу, чтобы сигнал от кода самого
@@ -5796,6 +5834,7 @@ u32 guest_run_si_fired(void)  { return g_si_fired; }
 u32 guest_run_sema_created(void) { return g_sema_created; }
 u32 guest_run_sema_waited(void)  { return g_sema_waited; }
 u32 guest_run_sema_stuck(void)   { return g_sema_stuck; }
+u32 guest_run_drain_marks(void)  { return g_drain_marks; }
 
 /* Сколько `ins`/`ext` эмулировано при SIGILL. 0 — SIGILL не было
  * или в окне не нашлось SPECIAL3. */

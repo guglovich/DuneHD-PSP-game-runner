@@ -153,7 +153,8 @@ u32  guest_run_cb_fired(void);
 u32  guest_run_si_fired(void);
 u32  guest_run_sema_created(void);   /* замер 97: uid-таблица семафоров */
 u32  guest_run_sema_waited(void);
-u32  guest_run_sema_stuck(void);   /* тики суб-прерываний (замер 92) */
+u32  guest_run_sema_stuck(void);
+u32  guest_run_drain_marks(void);   /* замер 103: грэйн-комплитер */   /* тики суб-прерываний (замер 92) */
 
 /* Показ последнего кадра гостя на экран плеера (конвейер RUA/GFX).
  * Вызывается из точки входа плагина ПОСЛЕ записи отчёта.

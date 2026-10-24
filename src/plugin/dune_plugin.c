@@ -595,6 +595,8 @@ static void report_imports(int fd)
 		put_hex(fd, guest_run_cb_created());
 		PUT(fd, " cb_fired=");
 		put_hex(fd, guest_run_cb_fired());
+		PUT(fd, " drain_marks=");
+		put_hex(fd, guest_run_drain_marks());
 		PUT(fd, " si_fired=");
 		put_hex(fd, guest_run_si_fired());
 		PUT(fd, " sema=");
