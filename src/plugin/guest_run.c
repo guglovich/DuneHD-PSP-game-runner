@@ -292,6 +292,8 @@ volatile u32  g_drain_obj;     /* $s0 цикла дренажа, снятый с
 static u32    g_drain_marks;
 static volatile u32 g_sound_sema;  /* uid звукового семафора (замер 108) */
 static u32    g_sound_signals;
+static volatile u32 g_engine_obj;  /* $a0 цикла движка (замер 111) */
+static u32    g_engine_dumped;
 static u32    g_drain_dumped;  /* 1 = дамп объекта уже сделан */
 
 static void guest_samp_handler(int sig, void *info, void *uc)
@@ -328,6 +330,13 @@ static void guest_samp_handler(int sig, void *info, void *uc)
 			g_drain_obj = *(const u32 *)((const unsigned char *)uc
 			                          + 40 + 8 * 16);
 		}
+		/* Замер 111: цикл движка 0x08AB6CC0..D40 — 25 млн
+		 * итераций на пустой очереди, PC там почти всегда.
+		 * $a0 = gregs[4] — ОБЪЕКТ ДВИЖКА (очередь: [+4] массив
+		 * 20-байт элементов, [+8] count). */
+		if (v >= 0x08AB6CC0u && v <= 0x08AB6D40u)
+			g_engine_obj = *(const u32 *)((const unsigned char *)uc
+			                      + 40 + 8 * 4);
 	}
 }
 volatile int  g_guest_finished;
@@ -2405,7 +2414,10 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 			 * наш насос поднимает его с периодом грейна. */
 			if (ra == 0x08AB60D0u)
 				g_sound_sema = uid;
-			if (g_log_fd >= 0 && wsw_n < 32) {
+			/* Замер 111: локи аллокатора (ra 08ABC174) —
+			 * шум, их 25 млн; логируем только прочие. */
+			if (g_log_fd >= 0 && wsw_n < 32
+			    && ra != 0x08ABC174u) {
 				wsw_n++;
 				early_log("WSW", uid);
 				early_log("WST", (u32)plat_gettid());
@@ -5396,6 +5408,44 @@ void guest_run_wait(u32 want, u32 max_ms)
 					break;
 				early_log(dwt[wk],
 				    *(volatile u32 *)(uintptr_t)ad);
+			}
+		}
+		/* Замер 111: одноразовый дамп объекта движка — очередь
+		 * [+4]/[+8] и первые элементы (если count когда-то
+		 * ненулевой — увидим формат из живых данных). */
+		if (g_engine_obj != 0 && g_engine_dumped == 0
+		    && guest_addr_direct_ok(g_engine_obj)) {
+			static const char *ewt[16] = {
+				"EW0", "EW1", "EW2", "EW3", "EW4", "EW5",
+				"EW6", "EW7", "EW8", "EW9", "EWA", "EWB",
+				"EWC", "EWD", "EWE", "EWF"
+			};
+			u32 wk;
+
+			g_engine_dumped = 1u;
+			early_log("EGO", g_engine_obj);
+			for (wk = 0; wk < 16u; wk++) {
+				u32 ad = g_engine_obj + 4u * wk;
+
+				if (!guest_addr_direct_ok(ad))
+					break;
+				early_log(ewt[wk],
+				    *(volatile u32 *)(uintptr_t)ad);
+			}
+			/* И массив элементов, если очередь непуста. */
+			{
+				u32 arr = *(volatile u32 *)(uintptr_t)
+				          (g_engine_obj + 4u);
+				u32 cnt = *(volatile u32 *)(uintptr_t)
+				          (g_engine_obj + 8u);
+
+				if (cnt != 0u && cnt < 16u
+				    && guest_addr_direct_ok(arr)) {
+					for (wk = 0; wk < cnt * 5u && wk < 40u; wk++)
+						early_log("EEL",
+						    *(volatile u32 *)(uintptr_t)
+						        (arr + 4u * wk));
+				}
 			}
 		}
 		/* Замер 108: аудио-прерывание — поднять звуковой
