@@ -927,6 +927,35 @@ static struct {
 	u32 rate;
 } g_sas[SAS_CORES];
 
+/* --- СЕМАФОРЫ (sceKernel*Sema) -----------------------------------------
+ *
+ * Замер 97 (eb5e7aee): CreateSema был лишь в is_implemented — ВСЕ восемь
+ * семафоров игры получили uid 0 (у PSP uid всегда > 0), и WaitSema/Signal
+ * крутились по невалидному uid. Блокировки выродились, порядок задач
+ * рассыпался: task-воркер успевал чистить флаг готовности звука ДО
+ * walk'а главного потока — аллокатор видел «звук выключен» и возвращал
+ * NULL. Настоящее БЛОКИРОВАНИЕ WaitSema (паками по 5 мс до SignalSema)
+ * восстанавливает PSP-порядок: воркер честно ждёт задачу, главный идёт
+ * вперёд. Ожидание ограничено 60 с (WST в логе) и размыкается
+ * g_time_to_exit — правило «ни один стаб не крутится вечно». */
+#define SEMA_SLOTS		16u
+#define SEMA_PARK_MS		5u
+#define SEMA_STUCK_MS		60000u
+
+static struct {
+	u32 used;    /* 1 = слот занят */
+	u32 count;   /* текущий счётчик */
+	u32 max;
+} g_sema[SEMA_SLOTS];
+static u32 g_sema_created;
+static u32 g_sema_waited;
+static u32 g_sema_stuck;
+
+static s32 sema_uid_valid(u32 uid)
+{
+	return uid >= 1u && uid <= SEMA_SLOTS && g_sema[uid - 1u].used != 0;
+}
+
 /* --- ОБРАТНЫЕ ВЫЗОВЫ sceKernel*Callback ------------------------------
  *
  * `sceKernelCreateCallback` возвращает uid > 0. Игра может использовать
@@ -2257,6 +2286,71 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	if (nid == 0x1D371B8Au)     /* sceKernelCancelVpl */
 		return 0;
 
+	if (nid == 0xD6DA4BA1u) {   /* sceKernelCreateSema(name,attr,init,cur) */
+		u32 slot;
+
+		for (slot = 0; slot < SEMA_SLOTS; slot++) {
+			if (g_sema[slot].used == 0) {
+				g_sema[slot].used = 1;
+				g_sema[slot].count =
+				    (args != NULL) ? args[3] : 0;
+				g_sema[slot].max = 0xFFFFFFFFu;
+				g_sema_created++;
+				if (g_sema_created <= 16u && g_log_fd >= 0) {
+					early_log("CSN", slot + 1u);
+					early_log("CSR", ra);
+				}
+				return slot + 1u;   /* uid > 0 ВСЕГДА */
+			}
+		}
+		return 0x8002017Fu;   /* SCE_KERNEL_ERROR_NO_UID */
+	}
+
+	if (nid == 0x28B6489Cu) {   /* sceKernelDeleteSema */
+		if (args != NULL && sema_uid_valid(args[0]))
+			g_sema[args[0] - 1u].used = 0;
+		return 0;
+	}
+
+	if (nid == 0x3F53E640u) {   /* sceKernelSignalSema */
+		if (args == NULL || !sema_uid_valid(args[0]))
+			return (s32)0x800201A1u;   /* UNKNOWN_UID */
+		g_sema[args[0] - 1u].count++;
+		return 0;
+	}
+
+	if (nid == 0x4E3A1105u) {   /* sceKernelWaitSema — БЛОКИРОВАТЬ */
+		if (args == NULL || !sema_uid_valid(args[0]))
+			return (s32)0x800201A1u;   /* UNKNOWN_UID */
+		{
+			u32 uid = args[0];
+			u32 waited = 0;
+
+			g_sema_waited++;
+			while (g_sema[uid - 1u].count == 0) {
+				if (g_time_to_exit != 0)
+					return (s32)0x800201A1u;
+				if (waited >= SEMA_STUCK_MS) {
+					g_sema_stuck++;
+					return (s32)0x800201A1u;
+				}
+				plat_sleep_ms(SEMA_PARK_MS);
+				waited += SEMA_PARK_MS;
+			}
+			g_sema[uid - 1u].count--;
+			return 0;
+		}
+	}
+
+	if (nid == 0x58B1F937u) {   /* sceKernelPollSema */
+		if (args == NULL || !sema_uid_valid(args[0]))
+			return (s32)0x800201A1u;
+		if (g_sema[args[0] - 1u].count == 0)
+			return (s32)0x800201ADu;   /* SEMA_ZERO */
+		g_sema[args[0] - 1u].count--;
+		return 0;
+	}
+
 	if (nid == 0x293B45B8u) {   /* sceKernelGetThreadId */
 		/* Замер 90 (652ee635): прежний возврат `args[0]` — ЭХО
 		 * случайного `$a0` вызывающего. У обёртки 0x08AB69A8
@@ -2769,9 +2863,6 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 		plat_sleep_ms((us + 999u) / 1000u);
 		return 0;
 	}
-
-	if (nid == 0x3F53E640u)     /* sceKernelSignalSema — возврат 0 = успех */
-		return 0;
 
 	/* --- Замер 90 (652ee635): звуковая инициализация LocoRoco шла
 	 * по нереализованным вызовам, и «0 = успех» дефолта НЕ весь
@@ -5624,6 +5715,11 @@ u32 guest_run_cb_created(void) { return g_cb.created; }
 
 u32 guest_run_cb_fired(void)   { return g_cb.fired; }
 u32 guest_run_si_fired(void)  { return g_si_fired; }
+
+/* Семафоры (замер 97): uid-таблица и честное блокирование. */
+u32 guest_run_sema_created(void) { return g_sema_created; }
+u32 guest_run_sema_waited(void)  { return g_sema_waited; }
+u32 guest_run_sema_stuck(void)   { return g_sema_stuck; }
 
 /* Сколько `ins`/`ext` эмулировано при SIGILL. 0 — SIGILL не было
  * или в окне не нашлось SPECIAL3. */

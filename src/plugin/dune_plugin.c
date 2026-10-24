@@ -597,6 +597,11 @@ static void report_imports(int fd)
 		put_hex(fd, guest_run_cb_fired());
 		PUT(fd, " si_fired=");
 		put_hex(fd, guest_run_si_fired());
+		PUT(fd, " sema=");
+		put_hex(fd, guest_run_sema_created());
+		put_hex(fd, guest_run_sema_waited());
+		PUT(fd, " sema_stuck=");
+		put_hex(fd, guest_run_sema_stuck());
 		PUT(fd, "\n");
 
 		/* Внутренние глобали гостя (vaddr образа, расшифрованы
