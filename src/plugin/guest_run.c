@@ -294,6 +294,7 @@ static volatile u32 g_sound_sema;  /* uid звукового семафора (�
 static u32    g_sound_signals;
 static volatile u32 g_engine_obj;  /* $a0 цикла движка (замер 111) */
 static u32    g_engine_dumped;
+static volatile u32 g_engine_tid;  /* tid ждущего звуков. семафор (112) */
 static u32    g_drain_dumped;  /* 1 = дамп объекта уже сделан */
 
 static void guest_samp_handler(int sig, void *info, void *uc)
@@ -309,7 +310,8 @@ static void guest_samp_handler(int sig, void *info, void *uc)
 	 * ЗАХВАТЫ указателей (дренаж/движок, замеры 111-112) идут
 	 * ВСЕГДА: бюджет съедается boot-фазой раньше стационара.
 	 */
-	if (g_log_fd < 0 || !guest_thread_fault(tid))
+	if (g_log_fd < 0
+	    || (!guest_thread_fault(tid) && tid != g_engine_tid))
 		return;
 	for (k = 0; k < 5; k++) {
 		u32 v;
@@ -2431,8 +2433,10 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 			 * с ra=0x08AB60D0 (зона SAS/грейнов). На PSP его
 			 * поднимает аудио-прерывание по завершении буфера;
 			 * наш насос поднимает его с периодом грейна. */
-			if (ra == 0x08AB60D0u)
+			if (ra == 0x08AB60D0u) {
 				g_sound_sema = uid;
+				g_engine_tid = (u32)plat_gettid();
+			}
 			/* Замер 111: локи аллокатора (ra 08ABC174) —
 			 * шум, их 25 млн; логируем только прочие. */
 			if (g_log_fd >= 0 && wsw_n < 32
@@ -5393,8 +5397,16 @@ void guest_run_wait(u32 want, u32 max_ms)
 		 * будет видна вживую, а не остановкой отчёта).
 		 * Период ~15 мс = VBlank. Лог SIE/SIX — первые 16
 		 * входов: SIE без SIX = обработчик не вернулся. */
-		if ((ms & 15u) == 0u)
+		if ((ms & 15u) == 0u) {
 			si_fire();
+			/* Замер 112: поток движка не покрывается
+			 * семплером (слот очищен выходами тунков
+			 * 0x08AB6798) — адресный SIGALRM ему. */
+			if (g_engine_tid != 0)
+				(void)plat_syscall(SYS_tgkill_mips,
+				    (long)plat_getpid(), (long)g_engine_tid,
+				    14, 0);
+		}
 		/* Грэйн-комплитер: раз в ~46 мс (60 Гц тик ×3 ≈ грейн
 		 * 2048 сэмплов на 44100) пометить буфер дренажа
 		 * готовым, как это сделал бы Media Engine. Поле
