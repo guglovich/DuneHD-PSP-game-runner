@@ -5416,6 +5416,26 @@ void guest_run_wait(u32 want, u32 max_ms)
 			u32 obj = g_drain_obj;
 			u32 fld = obj + 0x27Cu;
 
+			/* Замер 109: динамический дамп протокола грейна —
+			 * на каждом тике (первые 60) печатать счётчик,
+			 * поле и состояние: если игра потребляет, счётчик
+			 * [0x278] уменьшается, поле [0x27C] циклит
+			 * 0→1→0, состояние [0x2A8] меняется. Стоит на
+			 * месте — значит гейт в другом месте. */
+			{
+				static u32 dyn_n;
+
+				if (dyn_n < 60u && g_log_fd >= 0
+				    && guest_addr_direct_ok(obj + 0x2A8u)) {
+					dyn_n++;
+					early_log("DYC",
+					    *(volatile u32 *)(uintptr_t)(obj + 0x278u));
+					early_log("DYF",
+					    *(volatile u32 *)(uintptr_t)(obj + 0x27Cu));
+					early_log("DYS",
+					    *(volatile u32 *)(uintptr_t)(obj + 0x2A8u));
+				}
+			}
 			if (guest_addr_direct_ok(fld)
 			    && *(volatile u32 *)(uintptr_t)fld == 0u) {
 				*(volatile u32 *)(uintptr_t)fld = 1u;
