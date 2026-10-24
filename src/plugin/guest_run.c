@@ -2394,8 +2394,15 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 		{
 			u32 uid = args[0];
 			u32 waited = 0;
+			static u32 wsw_n;
 
 			g_sema_waited++;
+			if (g_log_fd >= 0 && wsw_n < 32) {
+				wsw_n++;
+				early_log("WSW", uid);
+				early_log("WST", (u32)plat_gettid());
+				early_log("WSR", ra);
+			}
 			while (g_sema[uid - 1u].count == 0) {
 				if (g_time_to_exit != 0)
 					return (s32)0x800201A1u;
