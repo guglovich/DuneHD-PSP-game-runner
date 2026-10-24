@@ -1186,6 +1186,7 @@ static struct {
 	u32 enabled;  /* EnableSubIntr прошёл */
 } g_si[SI_SLOTS];
 static u32 g_si_fired;
+static u32 g_in_si_fire;   /* 1 = исполняем тик-обработчик */
 
 static void si_fire(void)
 {
@@ -1201,8 +1202,14 @@ static void si_fire(void)
 		/* Замер 93 (38a1ac13): 600 032 тика не сделали ничего —
 		 * обработчик 0x08A385F4 первым делом требует a0 == слоту
 		 * (10), а мы передавали common. Ядро PSP зовёт суб-инт
-		 * обработчики как handler(slot, common). */
+		 * обработчики как handler(slot, common).
+		 *
+		 * Замер 98 (68fc0e24): флаг контекста — WaitSema изнутри
+		 * тика НЕ БЛОКИРУЕТ (на PSP это контекст прерывания),
+		 * иначе паркер-поток и семплер встают навсегда. */
+		g_in_si_fire = 1;
 		fn2(g_si[i].slot, g_si[i].common);
+		g_in_si_fire = 0;
 	}
 }
 
@@ -1886,8 +1893,17 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	 * слота, где лежал `$a2`, в отчёте стояло `0x00000020`, и по нему
 	 * раскладку построить было нельзя — пришлось сначала вернуть честный
 	 * слот и снять значение повторно. */
-	if (nid == 0x446D8DE6u)
-		return thread_created((args != NULL) ? args[1] : 0);
+	if (nid == 0x446D8DE6u) {
+		u32 ent = (args != NULL) ? args[1] : 0;
+		static u32 ct_n;
+
+		if (g_log_fd >= 0 && ct_n < 24) {
+			ct_n++;
+			early_log("CTX", (u32)plat_gettid());
+			early_log("CTE", ent);
+		}
+		return thread_created(ent);
+	}
 
 	/* `sceKernelStartThread(id, ...)`: запускаем то, что создали.
 	 *
@@ -2322,6 +2338,15 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	if (nid == 0x4E3A1105u) {   /* sceKernelWaitSema — БЛОКИРОВАТЬ */
 		if (args == NULL || !sema_uid_valid(args[0]))
 			return (s32)0x800201A1u;   /* UNKNOWN_UID */
+		/* Внутри тик-обработчика блокировать НЕЛЬЗЯ: на PSP это
+		 * контекст прерывания (замер 98 — паркер и семплер
+		 * заморожены таким ожиданием). Отвечаем мгновенно. */
+		if (g_in_si_fire != 0) {
+			if (g_sema[args[0] - 1u].count == 0)
+				return (s32)0x800201ADu;   /* SEMA_ZERO */
+			g_sema[args[0] - 1u].count--;
+			return 0;
+		}
 		{
 			u32 uid = args[0];
 			u32 waited = 0;
