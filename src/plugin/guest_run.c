@@ -290,6 +290,7 @@ volatile u32  g_drain_spin;
 static u32    g_drain_valve;
 volatile u32  g_drain_obj;     /* $s0 цикла дренажа, снятый семплером */
 static u32    g_drain_marks;
+static u32    g_drain_dumped;  /* 1 = дамп объекта уже сделан */
 
 static void guest_samp_handler(int sig, void *info, void *uc)
 {
@@ -5340,6 +5341,38 @@ void guest_run_wait(u32 want, u32 max_ms)
 		 * готовым, как это сделал бы Media Engine. Поле
 		 * [obj+0x27C] — аргумент аксессуара 0x08AB7228
 		 * (addiu s1,a0,636 в цикле 0x08AB43D0). */
+		/* Замер 104: одноразовый дамп объекта дренажа —
+		 * различает две гипотезы GRM=0: (A) g_drain_obj не
+		 * снимается (неверен офсет $s0 в кадре семплера —
+		 * тогда DGO=0), (B) объект валиден и поле [obj+0x27C]
+		 * ненулевое (семантика «поставлен», ME должен
+		 * потреблять — тогда DGO валиден и DW-слова покажут
+		 * протокол). */
+		if (g_drain_spin >= 3u && g_drain_dumped == 0
+		    && g_mod != 0 && g_mod->memory != 0) {
+			u32 o = g_drain_obj;
+			u32 wk;
+
+			static const char *dwt[16] = {
+				"DW0", "DW1", "DW2", "DW3", "DW4", "DW5",
+				"DW6", "DW7", "DW8", "DW9", "DWA", "DWB",
+				"DWC", "DWD", "DWE", "DWF"
+			};
+
+			g_drain_dumped = 1u;
+			early_log("DGO", o);
+			for (wk = 0; wk < 16u; wk++) {
+				u32 ad = o + 0x270u + 4u * wk;
+
+				if (o == 0 || ad < g_mod->base || ad + 4u
+				    > g_mod->base + g_mod->map_size)
+					break;
+				early_log(dwt[wk],
+				    *(const u32 *)((const unsigned char *)
+				                   g_mod->memory
+				                   + (ad - g_mod->base)));
+			}
+		}
 		if ((ms % 46u) == 0u && g_drain_obj != 0
 		    && g_mod != 0 && g_mod->memory != 0) {
 			u32 obj = g_drain_obj;
