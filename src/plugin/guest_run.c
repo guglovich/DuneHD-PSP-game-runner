@@ -982,6 +982,19 @@ static u32 g_sema_created;
 static u32 g_sema_waited;
 static u32 g_sema_stuck;
 
+/* Замер 105: гостевые адреса ЗА пределами образа (куча VPL
+ * 0x09000000+, объект дренажа 0x09009488) — тоже наша память:
+ * весь гость — фиксированные mmap, гостевый адрес = прямой
+ * хост-указатель. Диапазон: образ/VPL/зеркала. */
+static int guest_addr_direct_ok(u32 a)
+{
+	if (a >= 0x08800000u && a < 0x0A900000u)
+		return 1;   /* образ + VPL (+запас) */
+	if (a >= 0x48800000u && a < 0x4A900000u)
+		return 1;   /* uncached-зеркала */
+	return 0;
+}
+
 static s32 sema_uid_valid(u32 uid)
 {
 	return uid >= 1u && uid <= SEMA_SLOTS && g_sema[uid - 1u].used != 0;
@@ -5364,31 +5377,22 @@ void guest_run_wait(u32 want, u32 max_ms)
 			for (wk = 0; wk < 16u; wk++) {
 				u32 ad = o + 0x270u + 4u * wk;
 
-				if (o == 0 || ad < g_mod->base || ad + 4u
-				    > g_mod->base + g_mod->map_size)
+				if (o == 0 || !guest_addr_direct_ok(ad))
 					break;
 				early_log(dwt[wk],
-				    *(const u32 *)((const unsigned char *)
-				                   g_mod->memory
-				                   + (ad - g_mod->base)));
+				    *(volatile u32 *)(uintptr_t)ad);
 			}
 		}
-		if ((ms % 46u) == 0u && g_drain_obj != 0
-		    && g_mod != 0 && g_mod->memory != 0) {
+		if ((ms % 46u) == 0u && g_drain_obj != 0) {
 			u32 obj = g_drain_obj;
 			u32 fld = obj + 0x27Cu;
 
-			if (fld >= g_mod->base
-			    && fld + 4u <= g_mod->base + g_mod->map_size) {
-				unsigned char *mem =
-				    (unsigned char *)g_mod->memory;
-
-				if (*(u32 *)(mem + fld - g_mod->base) == 0u) {
-					*(u32 *)(mem + fld - g_mod->base) = 1u;
-					g_drain_marks++;
-					if (g_drain_marks <= 16u && g_log_fd >= 0)
-						early_log("GRM", obj);
-				}
+			if (guest_addr_direct_ok(fld)
+			    && *(volatile u32 *)(uintptr_t)fld == 0u) {
+				*(volatile u32 *)(uintptr_t)fld = 1u;
+				g_drain_marks++;
+				if (g_drain_marks <= 16u && g_log_fd >= 0)
+					early_log("GRM", obj);
 			}
 		}
 		plat_sleep_ms(1);
