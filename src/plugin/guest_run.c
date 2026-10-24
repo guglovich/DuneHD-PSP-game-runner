@@ -290,6 +290,8 @@ volatile u32  g_drain_spin;
 static u32    g_drain_valve;
 volatile u32  g_drain_obj;     /* $s0 цикла дренажа, снятый семплером */
 static u32    g_drain_marks;
+static volatile u32 g_sound_sema;  /* uid звукового семафора (замер 108) */
+static u32    g_sound_signals;
 static u32    g_drain_dumped;  /* 1 = дамп объекта уже сделан */
 
 static void guest_samp_handler(int sig, void *info, void *uc)
@@ -2397,6 +2399,12 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 			static u32 wsw_n;
 
 			g_sema_waited++;
+			/* Замер 108: семафор звукового движка — ожидание
+			 * с ra=0x08AB60D0 (зона SAS/грейнов). На PSP его
+			 * поднимает аудио-прерывание по завершении буфера;
+			 * наш насос поднимает его с периодом грейна. */
+			if (ra == 0x08AB60D0u)
+				g_sound_sema = uid;
 			if (g_log_fd >= 0 && wsw_n < 32) {
 				wsw_n++;
 				early_log("WSW", uid);
@@ -5389,6 +5397,15 @@ void guest_run_wait(u32 want, u32 max_ms)
 				early_log(dwt[wk],
 				    *(volatile u32 *)(uintptr_t)ad);
 			}
+		}
+		/* Замер 108: аудио-прерывание — поднять звуковой
+		 * семафор (тот, что ждёт зона 0x08AB60D0). На PSP
+		 * это делает HW по готовности буфера. */
+		if ((ms % 46u) == 0u && g_sound_sema != 0
+		    && g_sound_sema >= 1u && g_sound_sema <= SEMA_SLOTS
+		    && g_sema[g_sound_sema - 1u].used != 0) {
+			g_sema[g_sound_sema - 1u].count++;
+			g_sound_signals++;
 		}
 		/* Замер 106: ПЕРИОДИЧЕСКИЙ комплитер. Замер 105 показал:
 		 * одна пометка разомкнула весь конвейер — игра прошла
