@@ -474,6 +474,48 @@ static bool map_guest(GuestModule *m)
         }
     }
 
+    /* РЕГИОН МОДУЛЕЙ PSP — 0x00100000..0x001FFFFF (1 МиБ, оба
+     * вида). Замер 118: 47 фолтов в 0x001100xx — игра читает
+     * данные модулей, «загруженных» sceUtilityLoadModule (наши
+     * заглушки возвращают uid, но НЕ грузят). На PSP модули
+     * живут в младшей памяти; без региона каждый доступ
+     * эмулируется пропуском — продюсер голосов читает мусор.
+     * Оба вида из одного tmpfs-файла, как нулевой регион. */
+    m->mod_base = 0;
+    {
+        int mfd = open("/tmp/.psp_guest_mod", O_RDWR | O_CREAT | O_TRUNC,
+                       0600);
+
+        if (mfd >= 0 && ftruncate(mfd, (off_t)0x100000) != 0) {
+            close(mfd);
+            mfd = -1;
+        }
+        if (mfd >= 0) {
+            void *m1 = mmap((void *)(uintptr_t)0x00100000u, 0x100000,
+                            PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+            void *m2;
+
+            if (m1 == MAP_FAILED || (uintptr_t)m1 != 0x00100000u) {
+                if (m1 != MAP_FAILED)
+                    munmap(m1, 0x100000);
+                m1 = NULL;
+            }
+            m2 = mmap((void *)(uintptr_t)0x40100000u, 0x100000,
+                      PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+            if (m2 == MAP_FAILED || (uintptr_t)m2 != 0x40100000u) {
+                if (m2 != MAP_FAILED)
+                    munmap(m2, 0x100000);
+                m2 = NULL;
+            }
+            if (m1 != NULL) {
+                m->mod_base = 0x00100000u;
+                m->mod_mirror = (m2 != NULL) ? 0x40100000u : 0u;
+            }
+            close(mfd);
+            (void)unlink("/tmp/.psp_guest_mod");
+        }
+    }
+
     m->memory = p;
     m->map_size = map_size;
     m->tramp_base = (u32)((uintptr_t)p + ((m->span + 0xFFFu) & ~0xFFFu));
