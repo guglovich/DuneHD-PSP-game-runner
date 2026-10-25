@@ -826,6 +826,7 @@ static struct {
 	u32 frees;
 	u32 fails;
 } g_vpl;
+static u32 g_vmf_seen;   /* VMF уже писали: исходная площадь области логируется один раз */
 
 /* Указатель на `len` байт памяти гостя: образ, любой из стеков или
  * область VPL (куча гостя живёт там с 2026-10-15). NULL — адрес вне
@@ -2258,9 +2259,21 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 		 * меньше. Фактический размер области меняется от прогона к
 		 * прогону (лестница кандидатов в `map_vpl`), и гость строит
 		 * размеры своих куч ИЗ ОТВЕТА — то есть подстраивается. */
-		if (g_mod == NULL || g_mod->vpl_base == 0)
-			return 0;
-		return g_mod->vpl_bytes - g_vpl.off;
+		u32 free_bytes = 0;
+
+		if (g_mod != NULL && g_mod->vpl_base != 0)
+			free_bytes = g_mod->vpl_bytes - g_vpl.off;
+		/* Один раз при boot — как легла лестница: видно даже в
+		 * оборванном отчёте. Замер 120 оборвался до финальных
+		 * `vpl_*`, и провал области (курсор карва 0, фолты
+		 * 0x4B30xx) пришлось восстанавливать по косвенным
+		 * признакам. */
+		if (g_vmf_seen == 0) {
+			g_vmf_seen = 1;
+			if (g_log_fd >= 0)
+				early_log("VMF", free_bytes);
+		}
+		return free_bytes;
 	}
 
 	if (nid == 0x56C039B5u) {   /* sceKernelCreateVpl */
@@ -2289,9 +2302,19 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 			              (args != NULL) ? args[0] : 0);
 			g_vpl.off = start + span;
 			g_vpl.created++;
+			if (g_log_fd >= 0)
+				early_log("VCU", slot + 1u);
 			return slot + 1;
 		}
 		g_vpl.fails++;
+		/* Отказ CreateVpl — ранняя смерть boot: приёмник
+		 * AllocateVplCB получит 0, и карв пойдёт от нулевого
+		 * курсора (замер 120: фолты 0x4B30xx — второй хип лёг на
+		 * 0x4B30C0, размер первого). Размер в логе выдаёт и
+		 * причину: 0xFF000000 — нулевой ответ MaxFreeMemSize,
+		 * то есть лестница не легла вовсе. */
+		if (g_log_fd >= 0)
+			early_log("VCF", size);
 		return 0;
 	}
 
@@ -2372,13 +2395,29 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 
 	if (nid == 0x89B3D48Cu) {   /* sceKernelDeleteVpl */
 		u32 uid = (args != NULL) ? args[0] : 0;
+		u32 slot = (uid != 0) ? uid - 1u : 0;
 
-		/* Слот освобождается, курсор области — нет: как у
-		 * `part_alloc`, освобождение без записи в отчёт не
-		 * распознаешь, а тут счётчик `vpl_created=` не растёт
-		 * повторно только потому, что слот один и тот же. */
-		if (uid != 0 && uid <= VPL_SLOTS)
-			g_vpl.size[uid - 1u] = 0;
+		/* Слот освобождается, курсор области — ТОЛЬКО откатом
+		 * верхнего пула (LIFO): иначе повторная инициализация
+		 * видит MaxFreeMemSize меньше 0x100000, CreateVpl
+		 * отказывает, AllocateVplCB пишет в приёмник 0, и boot
+		 * карвит кучи от нулевого курсора — замер 120 погиб
+		 * именно так. Не-верхний пул курсор не трогает:
+		 * освобождение без записи в отчёт не распознаешь, а
+		 * счётчик `vpl_created=` не растёт повторно только
+		 * потому, что слот один и тот же. */
+		if (uid != 0 && uid <= VPL_SLOTS
+		    && g_vpl.size[slot] != 0) {
+			u32 start = g_vpl.start[slot];
+			u32 span = (g_vpl.size[slot] + (VPL_ALIGN - 1u))
+			           & ~(VPL_ALIGN - 1u);
+
+			if (start + span == g_vpl.off)
+				g_vpl.off = start;
+			g_vpl.size[slot] = 0;
+			g_vpl.used[slot] = 0;
+			g_vpl.start[slot] = 0;
+		}
 		return 0;
 	}
 

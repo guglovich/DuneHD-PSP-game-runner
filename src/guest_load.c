@@ -161,7 +161,9 @@ static bool compute_span(GuestModule *m)
  * `MaxFreeMemSize` честным нулём, и гость ведёт себя как раньше —
  * сбой кучи при этом виден в отчёте по полям `vpl_*`. */
 #define VPL_CANDIDATES 5u
-#define VPL_SIZES      5u
+#define VPL_SIZES      3u
+#define VPL_WINDOW_TOP  0x0A800000u
+#define VPL_WINDOW_STEP 0x00100000u
 
 static const u32 vpl_addr[VPL_CANDIDATES] = {
 	GUEST_VPL_BASE,
@@ -170,16 +172,60 @@ static const u32 vpl_addr[VPL_CANDIDATES] = {
 	GUEST_VPL_BASE - 0x00200000u,
 	GUEST_VPL_BASE - 0x00300000u,
 };
+/* Нижняя ступень — 0xC00000 (12 МиБ), не меньше: статический карв
+ * гостя занимает 0x842100 (таблица vaddr 0x30B790), а замер 102
+ * показал, что и 10 МиБ мало (HeapUser 90%, отказы аллокатора
+ * 0x08A38BD4 в 12 байтах). Прежние ступени 8/6/4/2 МиБ давали
+ * карв ВНЕ области — «деградированная куча» прогонов 37/120:
+ * 12 МиБ где угодно лучше, чем 2 МиБ по красивому адресу. */
 static const u32 vpl_size[VPL_SIZES] = {
-	GUEST_VPL_BYTES, 0x00800000u, 0x00600000u, 0x00400000u, 0x00200000u,
+	GUEST_VPL_BYTES, 0x01000000u, 0x00C00000u,
 };
 
-static void map_vpl(GuestModule *m)
+/* Одна попытка отобразить `bytes` по подсказке `hint`. Без
+ * `any_addr` адрес обязан совпасть с подсказкой: занято — снимаем
+ * отображение и пробуем следующий кандидат. С `any_addr` годится
+ * любой адрес, который выберет ядро, но не выше 0x3FFFFFFF:
+ * зеркало `+0x40000000` обязано остаться в user-памяти, иначе
+ * uncached-записи гостя уйдут в kernel-область и молча потеряются.
+ * Зеркало по-прежнему необязательно: не легло — работаем без
+ * него, как раньше. */
+static int vpl_try_map(GuestModule *m, int fd, u32 hint, u32 bytes,
+                       int any_addr)
 {
     void *v1;
     void *v2;
+    u32 got;
+    u32 want_mirror;
+
+    v1 = mmap((void *)(uintptr_t)hint, (size_t)bytes,
+              PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (v1 == MAP_FAILED)
+        return 0;
+    got = (u32)(uintptr_t)v1;
+    if ((!any_addr && got != hint) || got >= 0x40000000u) {
+        munmap(v1, (size_t)bytes);
+        return 0;
+    }
+    want_mirror = got + 0x40000000u;
+    v2 = mmap((void *)(uintptr_t)want_mirror, (size_t)bytes,
+              PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (v2 == MAP_FAILED || (u32)(uintptr_t)v2 != want_mirror) {
+        if (v2 != MAP_FAILED)
+            munmap(v2, (size_t)bytes);
+        v2 = NULL;
+    }
+    m->vpl_base = got;
+    m->vpl_bytes = bytes;
+    m->vpl_mirror = (v2 != NULL) ? want_mirror : 0;
+    return 1;
+}
+
+static void map_vpl(GuestModule *m)
+{
     u32 si;
     u32 ci;
+    u32 want;
     int fd;
 
     m->vpl_base = 0;
@@ -189,43 +235,28 @@ static void map_vpl(GuestModule *m)
     if (fd < 0)
         return;
     for (si = 0; si < VPL_SIZES && m->vpl_base == 0; si++) {
-        if (ftruncate(fd, (off_t)vpl_size[si]) != 0)
-            continue;
-        for (ci = 0; ci < VPL_CANDIDATES && m->vpl_base == 0; ci++) {
-            u32 want = vpl_addr[ci];
-            u32 want_mirror = want + 0x40000000u;
-            size_t bytes = vpl_size[si];
+        u32 bytes = vpl_size[si];
 
-            v1 = mmap((void *)(uintptr_t)want, bytes,
-                      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            if (v1 == MAP_FAILED) {
-                v1 = NULL;
-            } else if ((uintptr_t)v1 != want) {
-                munmap(v1, bytes);
-                v1 = NULL;
-            }
-            if (v1 == NULL)
-                continue;
-            v2 = mmap((void *)(uintptr_t)want_mirror, bytes,
-                      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            if (v2 == MAP_FAILED) {
-                v2 = NULL;
-            } else if ((uintptr_t)v2 != want_mirror) {
-                munmap(v2, bytes);
-                v2 = NULL;
-            }
-            if (v1 != NULL) {
-                m->vpl_base = want;
-                m->vpl_bytes = (u32)bytes;
-                if (v2 != NULL)
-                    m->vpl_mirror = want_mirror;
-            } else if (v2 != NULL) {
-                /* Основного отображения нет — зеркало одно не
-                 * годится: `MaxFreeMemSize` обязан отвечать за
-                 * кэшируемый адрес. */
-                munmap(v2, bytes);
-            }
-        }
+        if (ftruncate(fd, (off_t)bytes) != 0)
+            continue;
+        /* Якорные адреса — быстрая дорожка детерминизма. */
+        for (ci = 0; ci < VPL_CANDIDATES && m->vpl_base == 0; ci++)
+            vpl_try_map(m, fd, vpl_addr[ci], bytes, 0);
+        /* Свип окном [конец карты образа .. 0x0A800000) шагом
+         * 1 МиБ: ловит свободные окна, которые якоря пропускают.
+         * Пять адресов стоили игре boot: замер 120-финал лег
+         * целиком (курсор карва 0, фолты 0x4B30xx), соседний
+         * прогон деградировал до 2 МиБ по 0x08E00000. */
+        want = m->base + m->span + GUEST_TRAMP_SIZE + GUEST_PART_RESERVE;
+        want = (want + (VPL_WINDOW_STEP - 1u)) & ~(VPL_WINDOW_STEP - 1u);
+        for (; want + bytes <= VPL_WINDOW_TOP && m->vpl_base == 0;
+             want += VPL_WINDOW_STEP)
+            vpl_try_map(m, fd, want, bytes, 0);
+        /* Аварийный вариант: адрес выберет ядро. Площадь важнее
+         * адреса: без области AllocateVplCB пишет в приёмник 0, и
+         * boot карвит кучи от нулевого курсора. */
+        if (m->vpl_base == 0)
+            vpl_try_map(m, fd, 0, bytes, 1);
     }
     close(fd);
     (void)unlink("/tmp/.psp_guest_vpl");
