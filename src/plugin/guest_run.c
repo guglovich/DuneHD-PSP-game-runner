@@ -5448,6 +5448,49 @@ void guest_run_wait(u32 want, u32 max_ms)
 				    *(volatile u32 *)(uintptr_t)ad);
 			}
 		}
+		/* Замер 115: КЛАПАН ОБЪЕКТА ДВИЖКА. Аксессуар
+		 * 0x08AB7228 требует [obj+0]!=0 (готовность) и
+		 * [obj+4] (буфер) — формат подтверждён дренажным
+		 * аналогом (0x27C/0x280). Продюсер гостя не заполняет
+		 * (замеры 113-114: объект пуст) — заполняем с нашей
+		 * стороны каждые ~46 мс, как «Media Engine»:
+		 * грейн-буфер 8 КиБ нулей (тишина). */
+		if ((ms % 46u) == 0u && g_engine_obj != 0) {
+			u32 eobj = g_engine_obj;
+
+			if (guest_addr_direct_ok(eobj)
+			    && *(volatile u32 *)(uintptr_t)eobj == 0u) {
+				u32 bufp = *(volatile u32 *)(uintptr_t)
+				           (eobj + 4u);
+
+				if (bufp == 0u) {
+					u32 buf = part_head(part_alloc(8192u));
+
+					if (buf != 0) {
+						u32 i;
+
+						for (i = 0; i < 8192u; i += 4u)
+							*(volatile u32
+							  *)(uintptr_t)(buf + i) = 0u;
+						*(volatile u32 *)(uintptr_t)
+						    (eobj + 4u) = buf;
+						if (g_log_fd >= 0)
+							early_log("EGB", buf);
+					}
+				}
+				if (*(volatile u32 *)(uintptr_t)(eobj + 4u) != 0u) {
+					*(volatile u32 *)(uintptr_t)eobj = 1u;
+					if (g_log_fd >= 0) {
+						static u32 egm_n;
+
+						if (egm_n < 16u) {
+							egm_n++;
+							early_log("EGM", eobj);
+						}
+					}
+				}
+			}
+		}
 		/* Замер 111: одноразовый дамп объекта движка — очередь
 		 * [+4]/[+8] и первые элементы (если count когда-то
 		 * ненулевой — увидим формат из живых данных). */
