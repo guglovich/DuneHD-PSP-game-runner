@@ -987,5 +987,53 @@ skill + Ghidra MCP, опция inspect_firmware_regions).
 
 СЛЕДУЮЩИЙ ШАГ: (а) найти КОНСТРУКТОР EGO (2.5КиБ, +0x968) —
 кто пишет [EGO+0x280]? Перебрать остальные 14 писателей [+0x280]
-из списка; (б) реестр типов → кто его читает → где гейт загрузки
+из списка; (б) реестр типов → кто его читать → где гейт загрузки
 уровня; (в) REA (Ghidra MCP) для inspect_firmware_regions.
+
+## REA (Ghidra MCP) 27.10: ГЕЙТ [+0x27C] — ЭТО ФАЙЛ-СЛОТ SGS, НЕ EGO
+
+Ghidra подключена (порт 8089), образ guest.elf импортирован:
+12118 функций, 65546 символов, MIPS:LE:32, base 0 (vaddr).
+
+ГЛАВНАЯ ПЕРЕОЦЕНКА: гейт [+0x27C/+0x280] — НЕ часть объекта
+движка (EGO). Это ГЕЙТ ФАЙЛОВОГО СЛОТА SGS:
+
+  fileslot_wait_gate (0x2B0404) — берёт handle, вычисляет слот:
+    handle * 0x2A8 (680 Б на слот), статическая таблица
+    при ошибке: "fileslot.c:0x237 '%s%s' unknown file handle ID"
+
+  engine_slot_loop (0x2B039C) — декомпилирован Ghidra:
+    while (slot[0x278] > 0) { gate_accessor(slot + 0x27C); }
+
+  gate_accessor_sema_evf (0x2B3228) — wait_sema([g+4]) →
+    wait_evf([g+8])×[g+12] → signal([g+4]); вызовы из
+    FUN_002b039c (грейны) и FUN_002b199c.
+
+  ★ FUN_002aef40 = FILEslot_OPEN(name, flags, ...) ★
+    — ГЛАВНАЯ ФУНКЦИЯ ОТКРЫТИЯ ФАЙЛОВОГО СЛОТА:
+    1. FUN_002ae950(имя_файла, ...) — открыть файл
+    2. Если < 0 → return -1 (файл не найден)
+    3. LOCK (0x2B2714) → найти свободный слот (0x2A8 Б/слот,
+       занятость [slot+0x2AC]) → UNLOCK (0x2B275C)
+    4. Инициализация ~30 полей слота
+    5. gate_init_sema_evf(slot+0x524?, "sgsfile-slot-rsema")
+       — ИМЯ ГЕЙТА: "sgsfile-slot-rsema"!
+    6. При провале гейта → FUN_002af360 (закрыть слот) → -1
+    7. При успехе → fileslot_wait_gate(handle, 1) → FUN_002b04d4
+
+  Callers fileslot_open: FUN_002af288, FUN_002b0738.
+
+В прогоне 122/123 слот ЗАНЯТ (файл открыт), но гейт мусорный
+[BUID=08BF0380]. Противоречие: если fileslot_open вызван, гейт
+должен быть создан (иначе слот закрылся бы). Возможности:
+(a) fileslot_open НЕ вызван, слот занят по другой причине;
+(b) gate_init_sema_evf провалился, но код продолжил;
+(c) слот занят через другой путь.
+
+Функции переименованы в Ghidra: gate_accessor_sema_evf,
+engine_slot_loop, fileslot_wait_gate, gate_init_sema_evf.
+
+СЛЕДУЮЩИЙ ШАГ: декомпилировать FUN_002af288 и FUN_002b0738
+(callers fileslot_open) → кто вызывает fileslot_open и с какими
+именами файлов → проверить в прогоне: какие файлы открываются;
+сопоставить с BUID — какой слот с мусорным гейтом; найти разрыв.
