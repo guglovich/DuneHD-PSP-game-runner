@@ -826,7 +826,8 @@ static struct {
 	u32 frees;
 	u32 fails;
 } g_vpl;
-static u32 g_vmf_seen;   /* VMF уже писали: исходная площадь области логируется один раз */
+static u32 g_vmf_seen;
+static u32 g_buid_n;   /* BUID/BUR: first 32 bogus-uid, then silence */   /* VMF уже писали: исходная площадь области логируется один раз */
 
 /* Указатель на `len` байт памяти гостя: образ, любой из стеков или
  * область VPL (куча гостя живёт там с 2026-10-15). NULL — адрес вне
@@ -2451,15 +2452,32 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	}
 
 	if (nid == 0x3F53E640u) {   /* sceKernelSignalSema */
-		if (args == NULL || !sema_uid_valid(args[0]))
-			return (s32)0x800201A1u;   /* UNKNOWN_UID */
-		g_sema[args[0] - 1u].count++;
-		return 0;
+		if (args == NULL || !sema_uid_valid(args[0])) {
+			if (g_log_fd >= 0 && g_buid_n < 32) {
+				g_buid_n++;
+				early_log("BUID", args[0]);
+				early_log("BUR", ra);
+			}
+		return (s32)0x800201A1u;   /* UNKNOWN_UID */
+	}
+	g_sema[args[0] - 1u].count++;
+	return 0;
 	}
 
 	if (nid == 0x4E3A1105u) {   /* sceKernelWaitSema — БЛОКИРОВАТЬ */
-		if (args == NULL || !sema_uid_valid(args[0]))
+		if (args == NULL || !sema_uid_valid(args[0])) {
+			/* БОГОС-UID: движок ждёт на мусорном uid (part-арена
+			 * вместо создания семафора — гейт объекта не
+			 * инициализирован конструктором, замеры 111-122).
+			 * Логируем uid и ra — без этого разрыв цепочки не
+			 * виден в оборванном отчёте. */
+			if (g_log_fd >= 0 && g_buid_n < 32) {
+				g_buid_n++;
+				early_log("BUID", args[0]);
+				early_log("BUR", ra);
+			}
 			return (s32)0x800201A1u;   /* UNKNOWN_UID */
+		}
 		/* Внутри тик-обработчика блокировать НЕЛЬЗЯ: на PSP это
 		 * контекст прерывания (замер 98 — паркер и семплер
 		 * заморожены таким ожиданием). Отвечаем мгновенно. */
