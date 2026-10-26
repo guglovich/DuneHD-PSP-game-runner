@@ -1037,3 +1037,57 @@ engine_slot_loop, fileslot_wait_gate, gate_init_sema_evf.
 (callers fileslot_open) → кто вызывает fileslot_open и с какими
 именами файлов → проверить в прогоне: какие файлы открываются;
 сопоставить с BUID — какой слот с мусорным гейтом; найти разрыв.
+
+## REA 27.10 (продолжение): ПОЛНАЯ ЦЕПЬ ЗАГРУЗКИ ФАЙЛОВ → BGM
+
+Цепь раскрыта полностью (сверху вниз):
+
+  FUN_0024536C = BGM_INIT (xrefs=0, вызывается через VTABLE)
+    └→ file_loader (0xBC870 → 0xBC700):
+         1. FUN_002ad418() — режим: 1 = UMD
+         2. FUN_000bbf68(имя) — найти в таблице UMD
+         3. sprintf(path, "disc0:/sce_lbn0x%X_size0x%X", LBN, size)
+         4. do { fileslot_open_wrapper(path, 0x20) } while (fail)
+            — БЕСКОНЕЧНЫЙ RETRY при UMD!
+         5. Или обычный путь: file_open_with_path(имя, 0x20)
+         6. callback(param, size) — выделить буфер
+         7. file_read(handle, buffer, size)
+         8. fileslot_close(handle)
+
+  FUN_002af288 = fileslot_open_wrapper(имя, 0, 0, 0)
+    └→ FUN_002aef40 = fileslot_open(имя, flags, ...):
+         1. FUN_002ae950(имя) — открыть файл
+         2. Найти свободный слот (0x2A8 Б/слот)
+         3. Инициализация ~30 полей
+         4. gate_init_sema_evf(slot+X, "sgsfile-slot-rsema") ★
+         5. fileslot_wait_gate(handle, 1)
+
+  BGM_init после загрузки данных:
+    1. FUN_002baa58(data, 0) — создать SGS-объект из данных
+    2. Если двухдорожечный (param[1]!=0):
+       - FUN_002bd8b4(sgs, "BGM_MIDI", 0x40001) — MIDI-трек
+       - FUN_002bd8b4(sgs, "BGM_ATRAC", 0x40001) — ATRAC-трек
+       - FUN_002be574(midi, FUN_00245d08) — УСТАНОВИТЬ КОЛБЕК
+       - FUN_002be9ec(midi, atrac) — связать MIDI↔ATRAC
+    3. FUN_002bdf5c(track, 1) — PLAY!
+    4. printf("SgxStatus: %08x\n", status) ← проверочный признак
+
+  VTABLE-таблица BGM (0x38AB80-0x38AD80, .data):
+  Паттерн {0, функция} — таблица команд BGM-объекта.
+  BGM_init (0x24536C) на 0x38ABDC и 0x38AC4C — ДВА объекта.
+
+В ПРОГОНЕ 122/123: слот занят (файл открыт?), гейт мусорный.
+Возможности: (a) fileslot_open не дошёл до gate_init (файл
+не открылся → retry → зависание?); (b) gate_init провалился;
+(c) слот занят не через fileslot_open. BGM_init НЕ вызван
+("SgxStatus" не печатается — iow_count=0 в отчётах!).
+
+СЛЕДУЮЩИЕ ШАГИ (новая сессия):
+(а) МАРКЕР в fileslot_open (0x2AEF40): early_log("FSO", ra)
+    — покажет, вызывается ли открытие файлов вообще
+(б) МАРКЕР в BGM_init (0x24536C): early_log("BGM", 1)
+    — покажет, вызывается ли BGM-инициализация
+(в) Найти, кто читает vtable-таблицу BGM (0x38ABxx) —
+    ДВИЖОК BGM-объектов, управляющий жизненным циклом
+(г) Строка "SgxStatus: %08x" — grep в прогоне: если НЕ печатается
+    → BGM_init НЕ вызван → вся цепь мертва до этого уровня
