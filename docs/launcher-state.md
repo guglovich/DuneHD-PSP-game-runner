@@ -1307,3 +1307,54 @@ void SGS_update(float dt) {
 
 Плюс FUN_002C7BCC/002C7BF4 — lock/unlock мьютекса (0x460e603e —
 адрес мьютекса, но выглядит как инструкция — проверить).
+
+## REA 28.10 (продолжение): LOAD_STAGE = vtable [obj+4]+0x5C — stage-менеджер НЕ создан
+
+ПЯТЬ ПОДСИСТЕМ SGS_update — ВСЕ framework, НЕ state machine:
+  1. FUN_002BCB70 — АНИМАЦИЯ (lerp, float-таймеры, callback vtable [obj+0x90])
+  2. FUN_002C2DB0 — ТАЙМЕРЫ (связный список, тики, FUN_002C2C38)
+  3. FUN_002C5B58 — АУДИО (список, масштаб, FUN_002C58B4/FUN_002C5AD4)
+  4. FUN_002C7820 — СЛУЖЕБНЫЕ (массив stride 0x38, счётчики)
+  5. FUN_002BCE90 — ЖИЗНЕННЫЙ ЦИКЛ (update через vtable [obj+0x90]+0x0C)
+
+FUN_002A6200 в worker-цикле → FUN_002AC444 = `jr ra; nop` — ПОЛНОСТЬЮ ПУСТАЯ!
+
+LOAD_STAGE (FUN_0A275C):
+  1. file_loader("data/reside/region_euro.arc") — ГЛАВНЫЙ АРХИВ!
+  2. parse("stage_conf.bin") — конфиг уровня!
+  3. getStage(9, 2) — world 9, level 2!
+  4. FUN_002561FC(stage, 0, 0) — ЗАПУСК!
+  xrefs=0 — вызывается через vtable!
+
+VTABLE STAGE-МЕНЕДЖЕРА (0x370508, 3 vtable в объекте):
+  [obj+4]   = 0x370508 — ГЛАВНЫЙ (LOAD_STAGE = +0x5C!)
+  [obj+292] = 0x3703B0
+  [obj+16]  = 0x370568
+  +0x0C: FUN_0A1DEC, +0x14: FUN_0A0C04, +0x1C: FUN_0A0C0C,
+  +0x24: FUN_0A28F8, +0x2C: FUN_0A1F64, +0x34: FUN_0A0C14,
+  +0x44: FUN_0A26C8, +0x4C: FUN_0A0C50, +0x54: FUN_0A2724,
+  ★ +0x5C: FUN_0A275C = LOAD_STAGE!
+  +0x6C..0x12C: 15+ команд
+
+Конструктор stage-менеджера (~0x0A1C9C):
+  [obj+4] = 0x370508 (lui 0x37 + addiu 0x508)
+  вызывается из... тоже vtable! (0 jal)
+
+ПОСЛЕ HEAP BOOT: boot определяет язык (FUN_0024BFB4:
+sceUtilityGetSystemParamInt(8) → en/fr/es/de/...), сбрасывает
+глобали, потом... КУДА? Дизасс 0x088C3020+ — следующий шаг.
+
+stage_init (FUN_00256D84) вызывает через [vtable+0x8C] = NULL
+(0x370508+0x8C = 0x370594 = 0) — возможно, crash если вызвать!
+
+ЗАМКНУТЫЙ КРУГ: объекты создаются при загрузке уровня →
+загрузка не происходит → объекты не создаются → нет callbacks →
+нет transitions → worker крутится вхолостую.
+
+СЛЕДУЮЩИЕ ШАГИ (новая сессия):
+1. Реализовать sceIoOpen/Read/Close/Lseek — КРИТИЧНО!
+2. Дизасс boot-путь ПОСЛЕ 0x088C3020 — где ветвление "создать
+   stage-менеджер" vs "пропустить"?
+3. Найти, кто вызывает конструктор stage-менеджера — какой
+   vtable/объект?
+4. Маркер на FUN_0A275C (LOAD_STAGE) — вызывается ли вообще?
