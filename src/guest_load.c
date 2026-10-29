@@ -1634,17 +1634,13 @@ static void patch_worker_thread(GuestModule *m)
         return;
 
     /* Worker thread function at vaddr 0x0BF180 (runtime 0x088C3180) */
-    /* Jump at vaddr 0x0BF198 (runtime 0x088C3198): change j 0x08AB31F4 to j 0x088C3214 */
-    u32 *jump1 = (u32 *)(m->memory + 0x0BF198);
-    if (jump1 != NULL && *jump1 == 0x080ACC7Du) {
-        *jump1 = 0x08230C85u;  /* j 0x088C3214 (stage manager creation) */
+    /* At vaddr 0x0BF198 (runtime 0x088C3198): NOP -> patch to jal LOAD_STAGE (0x088A675C) */
+    /* LOAD_STAGE at vaddr 0x0A275C creates the stage manager */
+    u32 *patch_addr = (u32 *)(m->memory + 0x0BF198);
+    if (patch_addr != NULL && *patch_addr == 0x00000000u) {
+        *patch_addr = 0x0E2299D7u;  /* jal 0x088A675C (LOAD_STAGE) */
     }
-
-    /* Return at vaddr 0x0BF270 (runtime 0x088C3270): change jr ra to j 0x08AB31F4 */
-    u32 *jump2 = (u32 *)(m->memory + 0x0BF270);
-    if (jump2 != NULL && *jump2 == 0x03E00008u) {
-        *jump2 = 0x0A2AC87Du;  /* j 0x08AB31F4 (worker loop) */
-    }
+    /* Delay slot at 0x0BF1A0 remains NOP */
 }
 
 void guest_unload(GuestModule *m)

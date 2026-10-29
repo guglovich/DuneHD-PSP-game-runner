@@ -3270,9 +3270,13 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	    u32 timeout = (args != NULL) ? args[1] : 0;
 	    /* If thid == 0, perform stage initialization synchronously. */
 	    if (thid == 0) {
-	/* thid == 0 means "wait for engine thread" - block forever */
-	thid = g_engine_tid;
-}
+	        if (g_log_fd >= 0) early_log("WTE0", thid);
+	        /* Call LOAD_STAGE (0x0A275C) to initialize stage manager */
+	        u32 (*load_stage)(const char*, int, int, int) = 
+	            (u32(*)(const char*,int,int,int))(g_mod->base + 0x0A275C);
+	        load_stage("region_euro.arc", 2, 0x4000, 0);
+	        return 0;
+	    }
 	    if (thid == g_engine_tid) {
 	        while (g_time_to_exit == 0) {
 	            plat_sleep_ms(100);
