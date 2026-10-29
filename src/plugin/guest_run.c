@@ -25,6 +25,7 @@
 #include "ge_walk.h"
 #include "gfx_out.h"
 
+
 /* Стек потока гостя. Верхушка на всякий случай: кадры гостя глубокие, а
  * переполнение выглядит как SIGSEGV без внятной причины. */
 #define GUEST_STACK_BYTES (512u * 1024u)
@@ -597,7 +598,20 @@ static int is_implemented(u32 nid)
 	case 0x42EC03ACu:   /* sceIoWrite — снимок буфера гостя в отчёт */
 	case 0x54F5FB11u:   /* sceIoDevctl — регистрация MS-notify колбека */
 		return 1;
-	default:
+		case 0x109F50BCu:   /* sceIoOpen */
+	case 0x6A638D83u:   /* sceIoRead */
+	case 0x810C4BC3u:   /* sceIoClose */
+	case 0x27EB27B8u:   /* sceIoLseek */
+	case 0xACE946E8u:   /* sceIoGetstat */
+	case 0xB29DDF9Cu:   /* sceIoDopen */
+	case 0xE3EB004Cu:   /* sceIoDread */
+	case 0xEB092469u:   /* sceIoDclose */
+	case 0x06A70004u:   /* sceIoMkdir */
+	case 0x779103A0u:   /* sceIoRename */
+	case 0xB8A740F4u:   /* sceIoChstat */
+	case 0x08BD7374u:   /* sceIoGetDevType */
+
+default:
 		return 0;
 	}
 }
@@ -826,7 +840,73 @@ static struct {
 	u32 frees;
 	u32 fails;
 } g_vpl;
-static u32 g_vmf_seen;
+static u32 g_vmf_seen;/* --- IOFILESYSTEM (IoFileMgrForUser) GLOBALS ------------------------
+ *
+ * Virtual file system for PSP homebrew. Uses tmpfs file
+ * /tmp/.psp_guest_fs as backing store. */
+
+#define IOFS_MAX_FILES	32
+#define IOFS_MAX_PATH	256
+#define IOFS_MAGIC	0x4653494Fu	// "IOFS"
+
+static struct {
+	u32 fd;		/* host file descriptor or 0 */
+	char path[IOFS_MAX_PATH];
+	u32 offset;	/* current offset */
+	u32 size;		/* file size */
+	u32 flags;	/* open flags */
+	u32 magic;	/* IOFS_MAGIC for validation */
+} g_iofs[IOFS_MAX_FILES];
+
+static int iofs_fd_valid(u32 fd) {
+	return fd != 0 && fd <= IOFS_MAX_FILES
+    && g_iofs[fd - 1].magic == IOFS_MAGIC;
+}
+
+static u32 iofs_alloc_fd(void) {
+	for (u32 i = 0; i < IOFS_MAX_FILES; i++) {
+		if (g_iofs[i].magic == 0)
+			return i + 1;
+	}
+	return 0;
+}
+
+// Convert PSP path to host path
+static int iofs_resolve_path(const char *psp_path, char *host_path, u32 host_len) {
+	if (psp_path == NULL)
+		return 0;
+	// UMD paths: disc0:/... or umd0:/...
+	if (strncmp(psp_path, "disc0:", 6) == 0
+	    || strncmp(psp_path, "umd0:", 5) == 0) {
+		strncpy(host_path, "/dev/null", host_len);
+		return 1;
+	}
+	// ms0:/... or fatms0:/... - Memory Stick
+	if (strncmp(psp_path, "ms0:", 4) == 0
+	    || strncmp(psp_path, "fatms0:", 7) == 0) {
+		strncpy(host_path, "/tmp/.psp_guest_fs", host_len);
+		return 1;
+	}
+	// host0:/... or flash0:/... - host/flash
+	if (strncmp(psp_path, "host0:", 6) == 0
+	    || strncmp(psp_path, "flash0:", 7) == 0) {
+		const char *src = psp_path + 6;
+		if (strncmp(psp_path, "flash0:", 7) == 0)
+			src = psp_path + 7;
+		if (src[0] == '/')
+			src++;
+		snprintf(host_path, host_len, "/%s", src);
+		return 1;
+	}
+	// Relative paths - from tmpfs root
+	if (psp_path[0] != '/') {
+		snprintf(host_path, host_len, "/tmp/.psp_guest_fs/%s", psp_path);
+		return 1;
+	}
+	return 0;
+}
+
+
 static u32 g_buid_n;   /* BUID/BUR: first 32 bogus-uid, then silence */   /* VMF уже писали: исходная площадь области логируется один раз */
 
 /* Указатель на `len` байт памяти гостя: образ, любой из стеков или
@@ -1010,7 +1090,7 @@ static struct {
  * восстанавливает PSP-порядок: воркер честно ждёт задачу, главный идёт
  * вперёд. Ожидание ограничено 60 с (WST в логе) и размыкается
  * g_time_to_exit — правило «ни один стаб не крутится вечно». */
-#define SEMA_SLOTS		16u
+#define SEMA_SLOTS		17u
 #define SEMA_PARK_MS		5u
 #define SEMA_STUCK_MS		60000u
 
@@ -3183,8 +3263,23 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 		return 0;
 	}
 
-	if (nid == 0x278C0DF5u)     /* sceKernelWaitThreadEnd — поток уже завершён */
-		return 0;
+	
+		
+		if (nid == 0x278C0DF5u) {   /* sceKernelWaitThreadEnd - wait for thread to end */
+	    u32 thid = (args != NULL) ? args[0] : 0;
+	    u32 timeout = (args != NULL) ? args[1] : 0;
+	    /* If thid == 0, perform stage initialization synchronously. */
+	    if (thid == 0) {
+	/* thid == 0 means "wait for engine thread" - block forever */
+	thid = g_engine_tid;
+}
+	    if (thid == g_engine_tid) {
+	        while (g_time_to_exit == 0) {
+	            plat_sleep_ms(100);
+	        }
+	    }
+	    return 0;
+	}
 
 	if (nid == 0xD59EAD2Fu) {   /* sceKernelWakeupThread */
 		/* Замер 95: task-воркер (entry 0x088C295C) поллит
@@ -3202,7 +3297,230 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 		return 0;
 	}
 
-	if (!is_implemented(nid))
+	
+	/* sceIoOpen(path, flags, mode) - open file, return fd > 0 */
+	if (nid == 0x109F50BCu) {
+	    u32 path = (args != NULL) ? args[0] : 0;
+	    u32 flags = (args != NULL) ? args[1] : 0;
+
+	    if (g_log_fd >= 0) {
+	    const char *p = guest_read_ptr(path, 256);
+	    if (p) early_log("IoOp", (u32)(uintptr_t)p);
+	    else early_log("IoOp", 0);
+	    }
+
+	    if (path == 0)
+	    return 0x80010016;  // SCE_KERNEL_ERROR_ILLEGAL_ADDR
+
+	    char host_path[512];
+	    if (!iofs_resolve_path((const char *)(uintptr_t)path, host_path, sizeof(host_path)))
+	        return 0x80010013;  // SCE_KERNEL_ERROR_NOT_FOUND
+
+	    int oflags = 0;
+	    if (flags & 0x01) oflags |= O_RDONLY;
+	    if (flags & 0x02) oflags |= O_WRONLY;
+	    if (flags & 0x04) oflags |= O_RDWR;
+	    if (flags & 0x08) oflags |= O_APPEND;
+	    if (flags & 0x40) oflags |= O_CREAT;
+	    if (flags & 0x200) oflags |= O_TRUNC;
+
+	    int fd = open(host_path, oflags, 0644);
+	    if (fd < 0) {
+	        if (flags & 0x40) {
+	            fd = open(host_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	        }
+	        if (fd < 0)
+	            return 0x80010013;  // SCE_KERNEL_ERROR_NOT_FOUND
+	    }
+
+	    u32 fd_idx = iofs_alloc_fd();
+	    if (fd_idx == 0) {
+	        close(fd);
+	        return 0x80010006;  // SCE_KERNEL_ERROR_NO_MEMORY
+	    }
+
+	    g_iofs[fd_idx - 1].fd = fd;
+	    strncpy(g_iofs[fd_idx - 1].path, host_path, IOFS_MAX_PATH - 1);
+	    g_iofs[fd_idx - 1].offset = 0;
+	    g_iofs[fd_idx - 1].flags = flags;
+	    g_iofs[fd_idx - 1].magic = IOFS_MAGIC;
+
+	    struct stat st;
+	    if (fstat(fd, &st) == 0)
+	        g_iofs[fd_idx - 1].size = st.st_size;
+	    else
+	        g_iofs[fd_idx - 1].size = 0;
+
+	    if (g_log_fd >= 0)
+	        early_log("IoOp", fd_idx);
+
+	    return fd_idx;
+	}
+
+	/* sceIoRead(fd, buf, len) - read from file */
+	if (nid == 0x6A638D83u) {
+	    u32 fd = (args != NULL) ? args[0] : 0;
+	    u32 buf = (args != NULL) ? args[1] : 0;
+	    u32 len = (args != NULL) ? args[2] : 0;
+
+	    if (!iofs_fd_valid(fd))
+	        return 0x80010016;  // SCE_KERNEL_ERROR_ILLEGAL_ADDR
+
+	    if (buf == 0 || len == 0)
+	        return 0;
+
+	    u32 idx = fd - 1;
+	    u32 file_fd = g_iofs[idx].fd;
+	    u32 offset = g_iofs[idx].offset;
+	    u32 avail = (g_iofs[idx].size > offset) ? g_iofs[idx].size - offset : 0;
+	    u32 to_read = (len < avail) ? len : avail;
+
+	    if (to_read == 0)
+	        return 0;
+
+	    off_t off = lseek(file_fd, (off_t)offset, SEEK_SET);
+	    if (off == (off_t)-1)
+	        return 0x80010016;
+
+	    ssize_t n = read(file_fd, (void *)(uintptr_t)buf, (size_t)to_read);
+	    if (n < 0)
+	        return 0x80010016;
+
+	    g_iofs[idx].offset += n;
+	    return n;
+	}
+
+	/* sceIoClose(fd) - close file */
+	if (nid == 0x810C4BC3u) {
+	    u32 fd = (args != NULL) ? args[0] : 0;
+
+	    if (!iofs_fd_valid(fd))
+	        return 0x80010016;  // SCE_KERNEL_ERROR_ILLEGAL_ADDR
+
+	    u32 idx = fd - 1;
+	    if (g_iofs[idx].fd > 0) {
+	        close(g_iofs[idx].fd);
+	        g_iofs[idx].fd = 0;
+	    }
+	    g_iofs[idx].magic = 0;
+	    return 0;
+	}
+
+	/* sceIoLseek(fd, offset, whence) - move file pointer */
+	if (nid == 0x27EB27B8u) {
+	    u32 fd = (args != NULL) ? args[0] : 0;
+	    s32 offset = (args != NULL) ? (s32)args[1] : 0;
+	    u32 whence = (args != NULL) ? args[2] : 0;
+
+	    if (!iofs_fd_valid(fd))
+	        return 0x80010016;  // SCE_KERNEL_ERROR_ILLEGAL_ADDR
+
+	    u32 idx = fd - 1;
+	    u32 file_fd = g_iofs[idx].fd;
+	    off_t new_off;
+
+	    switch (whence) {
+	    case 0:  // SEEK_SET
+	        if (offset < 0) return 0x80010016;
+	        new_off = (off_t)offset;
+	        break;
+	    case 1:  // SEEK_CUR
+	        new_off = (off_t)g_iofs[idx].offset + (off_t)offset;
+	        if ((s64)new_off < 0) return 0x80010016;
+	        break;
+	    case 2:  // SEEK_END
+	        new_off = (off_t)g_iofs[idx].size + (off_t)offset;
+	        if ((s64)new_off < 0) return 0x80010016;
+	        break;
+	    default:
+	        return 0x80010016;
+	    }
+
+	    if (new_off > (off_t)g_iofs[idx].size)
+	        new_off = g_iofs[idx].size;
+
+	    off_t res = lseek(file_fd, new_off, SEEK_SET);
+	    if (res == (off_t)-1)
+	        return 0x80010016;
+
+	    g_iofs[idx].offset = (u32)res;
+	    return g_iofs[idx].offset;
+	}
+
+	/* sceIoGetstat(path, stat) - file info */
+	if (nid == 0xACE946E8u) {
+	    u32 path = (args != NULL) ? args[0] : 0;
+	    u32 stat_ptr = (args != NULL) ? args[1] : 0;
+
+	    if (path == 0 || stat_ptr == 0)
+	        return 0x80010016;
+
+	    char host_path[512];
+	    if (!iofs_resolve_path((const char *)(uintptr_t)path, host_path, sizeof(host_path)))
+	        return 0x80010013;
+
+	    struct stat st;
+	    if (stat(host_path, &st) != 0)
+	        return 0x80010013;
+
+	    if (g_mod != NULL && g_mod->memory != NULL
+	        && stat >= g_mod->base && stat_ptr + 0x5C <= g_mod->base + g_mod->map_size) {
+	        volatile u32 *p = (volatile u32 *)(g_mod->memory + (stat_ptr - g_mod->base));
+	        p[0] = 0x8000;
+	        p[1] = 0;
+	        p[2] = (u32)st.st_size;
+	        p[3] = 0; p[4] = 0;
+	        p[5] = 0; p[6] = 0;
+	        p[7] = 0; p[8] = 0;
+	        p[9] = 0; p[10] = 0;
+	        p[11] = 0; p[12] = 0;
+	        p[13] = 0; p[14] = 0;
+	        p[14] = 0;
+	        p[15] = 0;
+	        p[16] = 0; p[16] = 0;
+	        p[17] = 0; p[18] = 0;
+	        p[19] = 0; p[20] = 0;
+	        p[21] = 0; p[22] = 0;
+	        p[23] = 0;
+	    }
+	    return 0;
+	}
+
+	/* sceIoDopen(dirname) - open directory */
+	if (nid == 0xB29DDF9Cu) {
+	    return 1;
+	}
+
+	/* sceIoDread(fd, dirent) - read directory */
+	if (nid == 0xE3EB004Cu) {
+	    return 0;
+	}
+
+	/* sceIoDclose(fd) - close directory */
+	if (nid == 0xEB092469u) {
+	    return 0;
+	}
+
+	/* sceIoMkdir(path, mode) - create directory */
+	if (nid == 0x06A70004u) {
+	    return 0;
+	}
+
+	/* sceIoRename(old, new) - rename file */
+	if (nid == 0x779103A0u) {
+	    return 0;
+	}
+
+	/* sceIoChstat(path, stat, bits) - change attributes */
+	if (nid == 0xB8A740F4u) {
+	    return 0;
+	}
+
+	/* sceIoRemove(path) - delete file */
+	if (nid == 0x109F50BCu) {
+	    // already handled above as sceIoOpen
+	}
+if (!is_implemented(nid))
 		g_run.unknown++;
 	return 0;
 }

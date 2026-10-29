@@ -14,6 +14,10 @@
 
 #include <stddef.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 long plat_syscall(long n, long a0, long a1, long a2, long a3);
 long plat_syscall6(long n, long a0, long a1, long a2, long a3,
@@ -25,34 +29,16 @@ int   plat_read(int fd, void *buf, size_t len);
 int   plat_open_read(const char *path);
 int   plat_open_write(const char *path);
 
-/* Жив ли поток с данным tid.
- *
- * Нужна для ожидания гостя, и никакого другого способа узнать о его смерти
- * здесь нет: сам поток уходит в сырой `exit` из ассемблерной точки выхода,
- * минуя C, и единственный признак жил в C — после возврата, которого не
- * случается. На живом плеере это стоило полных 30 с ожидания на каждый
- * запуск при потоке, умершем сразу.
- *
- * Проверяется наличие каталога `/proc/self/task/<tid>`: он существует ровно
- * пока жив поток. Через `popen` считать нельзя — у дочернего процесса всегда
- * один поток, и такой прибор возвращает константу вместо измерения. */
+/* Жив ли поток с данным tid. */
 int   plat_thread_alive(int tid);
 
-/* Номер потока текущего. Вызывается в том числе из обработчика сигнала,
- * поэтому это сырой `syscall`. */
+/* Номер потока текущего. */
 int   plat_gettid(void);
 long  plat_file_size(int fd);
 void  plat_flush_icache(void *addr, size_t len);
 void *plat_mmap_file(void *addr, size_t len, int prot, int flags, int fd);
 
-/* Поток, разделяющий адресное пространство с вызывающим.
- *
- * Соглашение `clone` на MIPS нестандартное и снято дизассемблированием musl;
- * подробности — в комментарии у реализации. Значения флагов ниже взяты из
- * `<sched.h>` этого тулчейна, то есть из MIPS-значений, а не из x86.
- *
- * Возвращает pid потока в вызывающем; ветка ребёнка не возвращается — она
- * завершается вызовом `fn` и сырым `exit`. Отрицательное значение — ошибка. */
+/* Поток, разделяющий адресное пространство с вызывающим. */
 long plat_clone(void (*fn)(void *), void *arg, unsigned long stack_top,
                 unsigned long flags);
 
@@ -63,34 +49,28 @@ long plat_clone(void (*fn)(void *), void *arg, unsigned long stack_top,
 
 void plat_sleep_ms(unsigned long ms);
 
-/* Завершает текущий поток сырым `exit`.
- *
- * Не `exit` из libc: тот прогоняет обработчики выхода и сбрасывает буферы
- * `stdio` ВСЕГО процесса, а это процесс `shell`. Сырой вызов завершает
- * только поток. */
+/* Завершает текущий поток сырым `exit`. */
 void plat_thread_exit(void);
 
-/* Обработчик сигнала поверх сырого `rt_sigaction`.
- *
- * Раскладка структуры и размер маски измерены перебором на живом плеере,
- * а не взяты по аналогии с другими архитектурами. Расхождения обе скрытые:
- *
- *   - `sa_flags` идёт ПЕРВЫМ. С порядком «обработчик первым» ядро отвечает
- *     `EINVAL` при маске в 8 байт и `0` при маске в 16 — то есть ПРИНИМАЕТ
- *     МУСОР, ставя обработчиком поле флагов. Ошибка выглядит как «обработчик
- *     не сработал», и диагноз получается обратным истинному;
- *   - маска из 16 байт, потому что `_NSIG` на MIPS равно 128. При 8 байтах
- *     вызов отвергается;
- *   - `SA_SIGINFO` = 0x8, а не generic `0x4`. При неверном флаге ядро ошибки
- *     не сообщает, а просто передаёт обработчику другой набор аргументов.
- *
- * `restorer` ядро требует непустым, но наш обработчик из сбоя не выходит —
- * он завершает поток, — поэтому код восстановления не исполняется и может
- * быть любым корректным куском. */
+/* Обработчик сигнала поверх сырого `rt_sigaction`. */
 int plat_signal_raw(int sig, void *handler, unsigned long flags);
 int plat_signal_reset(int sig);
 
 int plat_vformat(char *buf, size_t cap, const char *fmt,
                  __builtin_va_list ap);
+
+/* --- дополнительные системные вызовы для IoFileMgr ------------------- */
+
+int open(const char *path, int flags, ...);
+int close(int fd);
+ssize_t read(int fd, void *buf, size_t count);
+ssize_t write(int fd, const void *buf, size_t count);
+off_t lseek(int fd, off_t offset, int whence);
+int stat(const char *path, struct stat *buf);
+int fstat(int fd, struct stat *buf);
+int close(int fd);
+int unlink(const char *path);
+int snprintf(char *buf, size_t size, const char *format, ...);
+int vsnprintf(char *buf, size_t size, const char *format, __builtin_va_list ap);
 
 #endif /* PLAT_H */

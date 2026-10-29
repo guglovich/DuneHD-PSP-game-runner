@@ -187,11 +187,6 @@ int open(const char *path, int flags, ...)
 	return (int)plat_syscall(SYS_open, (long)path, flags, (long)mode, 0);
 }
 
-int close(int fd)
-{
-	return plat_syscall(SYS_close, fd, 0, 0, 0) < 0 ? -1 : 0;
-}
-
 int ftruncate(int fd, off_t len)
 {
 	/* 4093 = __NR_ftruncate (тулчейн, MIPS o32). Файлы образа ~5 МиБ,
@@ -879,3 +874,49 @@ long _flush_cache(void *addr, int nbytes, int cache)
 }
 
 long _gp_disp = 0x7ff0;
+/* --- дополнительные системные вызовы для IoFileMgr ------------------- */
+
+#define SYS_stat       4010  /* __NR_stat */
+#define SYS_fstat      4011  /* __NR_fstat */
+#define SYS_lseek      4019  /* __NR_lseek */
+#define SYS_read       4003
+#define SYS_write      4004
+#define SYS_close      4006
+
+/* На MIPS o32 struct stat имеет размер 0x5C байт (92 байта).
+ * Поля: st_dev, st_ino, st_mode, st_nlink, st_uid, st_gid, st_rdev,
+ * st_size, st_atime, st_mtime, st_ctime, st_blksize, st_blocks.
+ * Время хранится как time64 (8 байт каждое). */
+
+int stat(const char *path, struct stat *buf)
+{
+	return (int)plat_syscall(SYS_stat, (long)path, (long)buf, 0, 0) < 0 ? -1 : 0;
+}
+
+int fstat(int fd, struct stat *buf)
+{
+	return (int)plat_syscall(SYS_fstat, fd, (long)buf, 0, 0) < 0 ? -1 : 0;
+}
+
+off_t lseek(int fd, off_t offset, int whence)
+{
+	return (off_t)plat_syscall(SYS_lseek, fd, (long)offset, whence, 0);
+}
+
+int read(int fd, void *buf, size_t count)
+{
+	return (int)plat_syscall(SYS_read, fd, (long)buf, (long)count, 0);
+}
+
+int write(int fd, const void *buf, size_t count)
+{
+	return (int)plat_syscall(SYS_write, fd, (long)buf, (long)count, 0);
+}
+
+int close(int fd)
+{
+	return plat_syscall(SYS_close, fd, 0, 0, 0) < 0 ? -1 : 0;
+}
+
+/* snprintf уже реализован через plat_vformat */
+
