@@ -83,7 +83,7 @@ psp-hle: $(SRC) $(KIRK_SRC)
 #   -fno-stack-protector  `__stack_chk_fail` на плеере нечем заменить
 # ---------------------------------------------------------------------------
 
-PLUGIN_SRC=src/plugin/dune_plugin.c src/plugin/plat.c \
+PLUGIN_SRC=src/plugin/dune_plugin.c src/plugin/plat.c src/iso9660.c \
            src/plugin/guest_run.c src/plugin/gfx_out.c \
            src/guest_load.c src/ge_walk.c
 PLUGIN_CFLAGS=-O2 -Wall -Wextra -march=mips32r2 -mabi=32 -Iinclude \

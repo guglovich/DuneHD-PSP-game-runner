@@ -47,6 +47,7 @@ typedef int            s32;
 #include "guest_load.h"
 #include "guest_run.h"
 #include "gfx_out.h"
+#include "iso9660.h"
 
 /* Причина, по которой `put` молча перестал писать.
  *
@@ -1092,6 +1093,16 @@ static void load_guest_report(int fd)
 	put_hex(fd, info.stub_top);
 	PUT(fd, "stub_end=");
 	put_hex(fd, info.stub_end);
+	PUT(fd, "\n");
+    /* Initialize ISO/CSO for UMD file access */
+    PUT(fd, "iso_init=");
+    if (iso_init("/D/psp_plugin_probe/LocoRoco.iso") == 0) {
+        put_hex(fd, 1);
+        PUT(fd, " (OK)\n");
+    } else {
+        put_hex(fd, 0);
+        PUT(fd, " (FAILED)\n");
+    }
 	PUT(fd, "\n");
 
 	if (!guest_scan_imports(&m, &info, &t)) {

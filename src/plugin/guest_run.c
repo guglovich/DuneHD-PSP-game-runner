@@ -24,6 +24,8 @@
 #include "guest_load.h"
 #include "ge_walk.h"
 #include "gfx_out.h"
+#include "iso9660.h"
+#define ISO_SECTOR_SIZE 2048
 
 
 /* Стек потока гостя. Верхушка на всякий случай: кадры гостя глубокие, а
@@ -871,41 +873,147 @@ static u32 iofs_alloc_fd(void) {
 	return 0;
 }
 
-// Convert PSP path to host path
-static int iofs_resolve_path(const char *psp_path, char *host_path, u32 host_len) {
-	if (psp_path == NULL)
-		return 0;
-	// UMD paths: disc0:/... or umd0:/...
-	if (strncmp(psp_path, "disc0:", 6) == 0
-	    || strncmp(psp_path, "umd0:", 5) == 0) {
-		strncpy(host_path, "/dev/null", host_len);
-		return 1;
-	}
-	// ms0:/... or fatms0:/... - Memory Stick
-	if (strncmp(psp_path, "ms0:", 4) == 0
-	    || strncmp(psp_path, "fatms0:", 7) == 0) {
-		strncpy(host_path, "/tmp/.psp_guest_fs", host_len);
-		return 1;
-	}
-	// host0:/... or flash0:/... - host/flash
-	if (strncmp(psp_path, "host0:", 6) == 0
-	    || strncmp(psp_path, "flash0:", 7) == 0) {
-		const char *src = psp_path + 6;
-		if (strncmp(psp_path, "flash0:", 7) == 0)
-			src = psp_path + 7;
-		if (src[0] == '/')
-			src++;
-		snprintf(host_path, host_len, "/%s", src);
-		return 1;
-	}
-	// Relative paths - from tmpfs root
-	if (psp_path[0] != '/') {
-		snprintf(host_path, host_len, "/tmp/.psp_guest_fs/%s", psp_path);
-		return 1;
-	}
-	return 0;
+
+
+/* ================================================================
+ * ISO/CSO file operations (access g_mod and g_iofs directly)
+ * ================================================================ */
+
+/* Open file from ISO/CSO */
+static int iso_open_file(struct iso_file *iso, const char *path, uint32_t flags, u32 *out_fd)
+{
+    uint32_t extent, size;
+    if (!iso || iso_find_file(iso, path, &extent, &size) != 0)
+        return -1;
+
+    u32 fd_idx = iofs_alloc_fd();
+    if (fd_idx == 0)
+        return -1;
+
+    g_iofs[fd_idx - 1].fd = (int)iso;  /* Store iso_file pointer as fd */
+    g_iofs[fd_idx - 1].offset = 0;
+    g_iofs[fd_idx - 1].size = size;
+    g_iofs[fd_idx - 1].flags = flags;
+    g_iofs[fd_idx - 1].magic = IOFS_MAGIC | 0x80000000;  /* Mark as ISO file */
+    snprintf(g_iofs[fd_idx - 1].path, IOFS_MAX_PATH, "iso:%s", path);
+
+    *out_fd = fd_idx;
+    return 0;
 }
 
+/* Read from ISO/CSO file */
+static ssize_t iso_read_file(u32 fd, void *buf, size_t len)
+{
+    if (!iofs_fd_valid(fd))
+        return -1;
+    u32 idx = fd - 1;
+    if ((g_iofs[idx].magic & 0x80000000) == 0)
+        return -1;  /* Not an ISO file */
+
+    struct iso_file *iso = (struct iso_file *)(uintptr_t)g_iofs[idx].fd;
+    if (!iso)
+        return -1;
+
+    uint32_t offset = g_iofs[idx].offset;
+    uint32_t avail = (g_iofs[idx].size > offset) ? g_iofs[idx].size - offset : 0;
+    uint32_t to_read = (len < avail) ? len : avail;
+
+    if (to_read == 0)
+        return 0;
+
+    /* Calculate LBA and offset within sector */
+    uint32_t start_lba = iso->extent_lba + (offset / ISO_SECTOR_SIZE);
+    uint32_t sector_offset = offset % ISO_SECTOR_SIZE;
+
+    uint8_t sector_buf[ISO_SECTOR_SIZE];
+    size_t total_read = 0;
+
+    while (total_read < to_read) {
+        if (iso_read_sector(iso, start_lba, sector_buf) != 0)
+            return -1;
+
+        uint32_t chunk = ISO_SECTOR_SIZE - sector_offset;
+        if (chunk > to_read - total_read)
+            chunk = to_read - total_read;
+
+        memcpy((uint8_t *)buf + total_read, sector_buf + sector_offset, chunk);
+        total_read += chunk;
+        sector_offset = 0;
+        start_lba++;
+    }
+
+    g_iofs[idx].offset += total_read;
+    return total_read;
+}
+
+/* Seek in ISO/CSO file */
+static int iso_seek_file(u32 fd, int32_t offset, u32 whence)
+{
+    if (!iofs_fd_valid(fd))
+        return -1;
+    u32 idx = fd - 1;
+    if ((g_iofs[idx].magic & 0x80000000) == 0)
+        return -1;
+
+    int64_t new_off;
+    switch (whence) {
+        case 0:  // SEEK_SET
+            if (offset < 0) return -1;
+            new_off = offset;
+            break;
+        case 1:  // SEEK_CUR
+            new_off = (int64_t)g_iofs[idx].offset + offset;
+            if (new_off < 0) return -1;
+            break;
+        case 2:  // SEEK_END
+            new_off = (int64_t)g_iofs[idx].size + offset;
+            if (new_off < 0) return -1;
+            break;
+        default:
+            return -1;
+    }
+
+    if (new_off > (int64_t)g_iofs[idx].size)
+        new_off = g_iofs[idx].size;
+
+    g_iofs[idx].offset = (uint32_t)new_off;
+    return g_iofs[idx].offset;
+}
+
+/* Close ISO/CSO file handle */
+static int iso_close_file(u32 fd)
+{
+    if (!iofs_fd_valid(fd))
+        return -1;
+    u32 idx = fd - 1;
+    if ((g_iofs[idx].magic & 0x80000000) == 0)
+        return -1;
+
+    /* Don't close the ISO file itself - it's shared */
+    g_iofs[idx].magic = 0;
+    return 0;
+}
+
+/* Get file stat from ISO/CSO */
+static int iso_getstat_file(u32 fd, void *stat_buf)
+{
+    if (!iofs_fd_valid(fd))
+        return -1;
+    u32 idx = fd - 1;
+    if ((g_iofs[idx].magic & 0x80000000) == 0)
+        return -1;
+
+    if (g_mod != NULL && g_mod->memory != NULL
+        && (uintptr_t)stat_buf >= g_mod->base
+        && (uintptr_t)stat_buf + 0x5C <= (uintptr_t)g_mod->base + g_mod->map_size) {
+        volatile uint32_t *p = (volatile uint32_t *)(g_mod->memory + ((uintptr_t)stat_buf - g_mod->base));
+        p[0] = 0x8000;  /* File attribute */
+        p[1] = 0;
+        p[2] = g_iofs[idx].size;
+        for (int i = 3; i < 24; i++) p[i] = 0;
+    }
+    return 0;
+}
 
 static u32 g_buid_n;   /* BUID/BUR: first 32 bogus-uid, then silence */   /* VMF уже писали: исходная площадь области логируется один раз */
 
@@ -3317,8 +3425,19 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	    return 0x80010016;  // SCE_KERNEL_ERROR_ILLEGAL_ADDR
 
 	    char host_path[512];
-	    if (!iofs_resolve_path((const char *)(uintptr_t)path, host_path, sizeof(host_path)))
+	    if (!iofs_resolve_path_iso((const char *)(uintptr_t)path, host_path, sizeof(host_path)))
 	        return 0x80010013;  // SCE_KERNEL_ERROR_NOT_FOUND
+
+	    /* Check if this is an ISO file path */
+	    if (strncmp(host_path, "iso:", 4) == 0) {
+	        u32 fd_idx;
+	        if (iso_open_file(g_iso_ctx.file, host_path + 4, flags, &fd_idx) == 0) {
+	            if (g_log_fd >= 0)
+	                early_log("IoOp", fd_idx);
+	            return fd_idx;
+	        }
+	        return 0x80010013;  // SCE_KERNEL_ERROR_NOT_FOUND
+	    }
 
 	    int oflags = 0;
 	    if (flags & 0x01) oflags |= O_RDONLY;
@@ -3374,6 +3493,14 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	        return 0;
 
 	    u32 idx = fd - 1;
+	    /* Check if this is an ISO file */
+	    if (g_iofs[idx].magic & 0x80000000) {
+	        ssize_t n = iso_read_file(fd, (void *)(uintptr_t)buf, (size_t)len);
+	        if (n < 0)
+	            return 0x80010016;
+	        return n;
+	    }
+
 	    u32 file_fd = g_iofs[idx].fd;
 	    u32 offset = g_iofs[idx].offset;
 	    u32 avail = (g_iofs[idx].size > offset) ? g_iofs[idx].size - offset : 0;
@@ -3402,6 +3529,10 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	        return 0x80010016;  // SCE_KERNEL_ERROR_ILLEGAL_ADDR
 
 	    u32 idx = fd - 1;
+	    /* Check if this is an ISO file */
+	    if (g_iofs[idx].magic & 0x80000000) {
+	        return iso_close_file(fd);
+	    }
 	    if (g_iofs[idx].fd > 0) {
 	        close(g_iofs[idx].fd);
 	        g_iofs[idx].fd = 0;
@@ -3420,6 +3551,11 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	        return 0x80010016;  // SCE_KERNEL_ERROR_ILLEGAL_ADDR
 
 	    u32 idx = fd - 1;
+	    /* Check if this is an ISO file */
+	    if (g_iofs[idx].magic & 0x80000000) {
+	        return iso_seek_file(fd, offset, whence);
+	    }
+
 	    u32 file_fd = g_iofs[idx].fd;
 	    off_t new_off;
 
@@ -3460,15 +3596,31 @@ static u32 guest_import_inner(u32 index, const u32 *args, u32 k0, u32 ra)
 	        return 0x80010016;
 
 	    char host_path[512];
-	    if (!iofs_resolve_path((const char *)(uintptr_t)path, host_path, sizeof(host_path)))
+	    if (!iofs_resolve_path_iso((const char *)(uintptr_t)path, host_path, sizeof(host_path)))
 	        return 0x80010013;
+
+	    /* Check if this is an ISO file path */
+	    if (strncmp(host_path, "iso:", 4) == 0) {
+	        /* For ISO files, we need to open the file first to get its size */
+	        /* This is a simplified implementation - in practice we'd need to
+	         * find the file in the ISO without opening it */
+	        if (g_mod != NULL && g_mod->memory != NULL
+	            && stat_ptr >= g_mod->base && stat_ptr + 0x5C <= g_mod->base + g_mod->map_size) {
+	            volatile u32 *p = (volatile u32 *)(g_mod->memory + (stat_ptr - g_mod->base));
+	            p[0] = 0x8000;
+	            p[1] = 0;
+	            p[2] = 0;  /* Size unknown without opening */
+	            for (int i = 3; i < 24; i++) p[i] = 0;
+	        }
+	        return 0;
+	    }
 
 	    struct stat st;
 	    if (stat(host_path, &st) != 0)
 	        return 0x80010013;
 
 	    if (g_mod != NULL && g_mod->memory != NULL
-	        && stat >= g_mod->base && stat_ptr + 0x5C <= g_mod->base + g_mod->map_size) {
+	        && stat_ptr >= g_mod->base && stat_ptr + 0x5C <= g_mod->base + g_mod->map_size) {
 	        volatile u32 *p = (volatile u32 *)(g_mod->memory + (stat_ptr - g_mod->base));
 	        p[0] = 0x8000;
 	        p[1] = 0;
